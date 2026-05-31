@@ -1097,8 +1097,18 @@ async function uploadFiles(files) {
           }
         };
         xhr.onload = function() {
-          if (xhr.status >= 200 && xhr.status < 300) resolve();
-          else reject(new Error(t('upload_put_failed', xhr.status)));
+          if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+          // Surface the underlying server/Telegram error instead of just the status code
+          var serverMsg = '';
+          try {
+            var rt = xhr.responseText || '';
+            if (rt.charAt(0) === '{') serverMsg = JSON.parse(rt).error || '';
+            else {
+              var a = rt.indexOf('<Message>'), b = rt.indexOf('</Message>');
+              if (a >= 0 && b > a) serverMsg = rt.slice(a + 9, b);
+            }
+          } catch (_e) {}
+          reject(new Error(serverMsg ? t('upload_put_failed', xhr.status) + ': ' + serverMsg : t('upload_put_failed', xhr.status)));
         };
         xhr.onerror = function() { reject(new Error('Network error')); };
         xhr.ontimeout = function() { reject(new Error('Timeout')); };

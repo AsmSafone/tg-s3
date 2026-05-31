@@ -1,4 +1,9 @@
--- Initial schema: all tables for fresh deployments
+-- Initial schema: all tables for fresh deployments.
+-- This is the BASELINE table set. Columns introduced by later migrations
+-- (is_public -> 0002, optimize_config -> 0003, default_encryption -> 0004)
+-- MUST NOT be declared here, otherwise their `ALTER TABLE ... ADD COLUMN`
+-- statements fail on a fresh deploy with "duplicate column name", which
+-- also halts every subsequent migration.
 
 CREATE TABLE IF NOT EXISTS buckets (
     name            TEXT    PRIMARY KEY,
@@ -7,8 +12,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     tg_topic_id     INTEGER,
     description     TEXT,
     object_count    INTEGER NOT NULL DEFAULT 0,
-    total_size      INTEGER NOT NULL DEFAULT 0,
-    is_public       INTEGER NOT NULL DEFAULT 0
+    total_size      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS objects (
