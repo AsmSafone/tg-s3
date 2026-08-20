@@ -1,10 +1,10 @@
 # 媒体处理与文件分享
 
-## 一、文件分块引擎 [Phase 2 - 分块上传/下载未实现]
+## 一、文件分块引擎
 
-> 当前实现中，单文件通过 Bot API 上传 (<=20MB) 或 VPS Local Bot API (<=2GB)。
-> 分块上传/下载流程用于突破 2GB 限制，留待后续版本实现。chunks 表已创建，CRUD
-> 操作已实现，当前用于 DeleteObject 时清理关联的 chunk 记录和 TG 消息。
+分块引擎已接入 S3 Multipart 主链路。标准 Bot API 模式下每个 Part 不超过 20MiB，
+完成后 Part 直接成为永久 Telegram Chunk；Local Bot API/VPS 模式可以使用更大的物理 Part。
+逻辑对象支持完整流式读取、跨 Chunk Range、逐 Chunk SSE、复制与完整生命周期清理。
 
 ### 分块策略
 
@@ -18,15 +18,15 @@
 ```
 大文件 (>= chunk_size)
     │
-    ├─ 1. Worker/VPS 接收完整文件流
-    ├─ 2. 流式切块，每块送 TG sendDocument
-    ├─ 3. 每块获得 file_id, message_id
+    ├─ 1. S3 客户端发起 Multipart Upload
+    ├─ 2. 每个 UploadPart 独立送 TG sendDocument
+    ├─ 3. Complete 时直接保留选中的 Part
     ├─ 4. 写入 chunks 表:
     │     chunk_index=0, offset=0, size=18MB, file_id=aaa
     │     chunk_index=1, offset=18MB, size=18MB, file_id=bbb
     │     chunk_index=2, offset=36MB, size=5MB, file_id=ccc
     │
-    └─ 5. 写入 objects 表: size=41MB (chunks 表记录分块映射, Phase 2 需扩展 objects 表增加 is_chunked/chunk_count 列)
+    └─ 5. 原子写入 objects: size=41MB, is_chunked=1, chunk_count=3
 ```
 
 ### 下载重组装流程

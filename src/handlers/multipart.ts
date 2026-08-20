@@ -1,22 +1,23 @@
 import type { Env, S3Request } from '../types';
 import { MetadataStore } from '../storage/metadata';
-import { uploadToTelegram, RateLimitError, FileTooLargeError, type UploadResult } from '../telegram/upload';
+import { uploadToTelegram, RateLimitError, FileTooLargeError } from '../telegram/upload';
 import { downloadFromTelegram } from '../telegram/download';
 import { TelegramClient } from '../telegram/client';
 import { computeEtag, computeMultipartEtag, sha256Hex } from '../utils/crypto';
 import { extractUserMetadata, extractSystemMetadata, etagMatches } from '../utils/headers';
 import { readBody } from './put-object';
-import { deleteDerivatives, deleteChunks } from './delete-object';
+import { deleteDerivatives } from './delete-object';
 import { purgeCdnCache, purgeR2Cache } from './get-object';
 import { initiateMultipartXml, completeMultipartXml, listPartsXml, listMultipartUploadsXml, copyPartResultXml, xmlResponse, errorResponse } from '../xml/builder';
-import { BOT_API_GETFILE_LIMIT, VPS_SINGLE_FILE_MAX, S3_MIN_PART_SIZE, S3_MAX_KEYS_DEFAULT, S3_MAX_PART_NUMBER } from '../constants';
+import { BOT_API_GETFILE_LIMIT, VPS_SINGLE_FILE_MAX, S3_MIN_PART_SIZE, S3_MAX_KEYS_DEFAULT, S3_MAX_PART_NUMBER, S3_MAX_OBJECT_SIZE, WORKER_BODY_LIMIT } from '../constants';
 import { VpsClient } from '../media/vps-client';
 import { parseCompleteMultipart } from '../xml/parser';
 import {
   parseSseCHeaders, validateKeyMd5, encrypt, decrypt, addSseMetadata, SseCError,
   encryptS3, addSseS3Metadata, decryptS3,
-  isEncrypted, isEncryptedS3, getStoredKeyMd5, SSE_COPY_HEADERS,
+  isEncrypted, isEncryptedS3, getStoredKeyMd5, SSE_COPY_HEADERS, SSE_HEADERS,
 } from '../utils/sse';
+import { isChunkedObject, readChunkRange, validateChunkLayout } from '../storage/chunked';
 
 function clampInt(val: string | null, defaultVal: number, min: number, max: number): number {
   const n = parseInt(val || String(defaultVal), 10);
@@ -86,10 +87,13 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
 
   // SSE-C: validate headers match the upload's SSE metadata (if any)
   let uploadSseMd5: string | null = null;
+  let uploadSseKeyBase64: string | null = null;
+  let uploadUseSseS3 = false;
   if (upload.system_metadata) {
     try {
       const sm = JSON.parse(upload.system_metadata);
       if (sm._sse === 'AES256') uploadSseMd5 = sm._sse_key_md5;
+      if (sm._sse_s3 === 'AES256') uploadUseSseS3 = true;
     } catch { /* ignore */ }
   }
   if (uploadSseMd5) {
@@ -98,14 +102,46 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
       if (!sseParams) return errorResponse(400, 'InvalidRequest', 'This multipart upload was initiated with SSE-C. You must provide the encryption key.');
       await validateKeyMd5(sseParams);
       if (sseParams.keyMd5 !== uploadSseMd5) return errorResponse(400, 'InvalidArgument', 'The SSE-C key does not match the key used to initiate the multipart upload.');
+      uploadSseKeyBase64 = sseParams.keyBase64;
     } catch (e) {
       if (e instanceof SseCError) return errorResponse(400, 'InvalidArgument', e.message);
       throw e;
     }
   }
+  if (uploadUseSseS3 && !env.SSE_MASTER_KEY) {
+    return errorResponse(500, 'InternalError', 'This multipart upload uses SSE-S3 but SSE_MASTER_KEY is not configured.');
+  }
 
   const bucket = await store.getBucket(upload.bucket);
   if (!bucket) return errorResponse(404, 'NoSuchBucket', 'Bucket not found.');
+
+  const contentLength = parseInt(s3.headers.get('content-length') || '0', 10);
+  const decodedLength = parseInt(s3.headers.get('x-amz-decoded-content-length') || '0', 10);
+  const estimatedSize = decodedLength || contentLength;
+  const awsChunked = (s3.headers.get('x-amz-content-sha256') || '').startsWith('STREAMING-');
+
+  // Stream large, normally encoded parts through the VPS so Worker memory does
+  // not cap the physical chunk size. AWS's signed chunk framing must first be
+  // decoded locally, so that path remains subject to WORKER_BODY_LIMIT.
+  if (estimatedSize > BOT_API_GETFILE_LIMIT && env.VPS_URL && !awsChunked && s3.body) {
+    const encryptionOverhead = uploadSseKeyBase64 || uploadUseSseS3 ? 28 : 0;
+    if (estimatedSize + encryptionOverhead > VPS_SINGLE_FILE_MAX) {
+      return errorResponse(400, 'EntityTooLarge', 'Multipart part exceeds the 2GiB Local Bot API limit.');
+    }
+    return handleLargeUploadPartViaVps({
+      s3, env, ctx, store, uploadId, partNumber, bucket,
+      uploadKey: upload.key, size: estimatedSize,
+      sseKeyBase64: uploadSseKeyBase64 || undefined,
+      sseS3KeyBase64: uploadUseSseS3 ? env.SSE_MASTER_KEY : undefined,
+      sseKeyMd5: uploadSseMd5,
+      useSseS3: uploadUseSseS3,
+    });
+  }
+  if (estimatedSize > WORKER_BODY_LIMIT) {
+    return errorResponse(400, 'EntityTooLarge',
+      `Multipart part exceeds the ${WORKER_BODY_LIMIT} byte Worker buffering limit. ` +
+      'Use a part of at most 20MiB without VPS, or send Content-Length with VPS enabled.');
+  }
 
   // Read part body (handles AWS chunked streaming format transparently)
   const bodyBuf = await readBody(s3);
@@ -134,10 +170,16 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
 
   const etag = await computeEtag(bodyBuf);
 
+  // Multipart chunks are encrypted independently so Range reads can decrypt
+  // just the intersecting Telegram documents without consolidating the object.
+  let uploadData = bodyBuf;
+  if (uploadSseKeyBase64) uploadData = await encrypt(bodyBuf, uploadSseKeyBase64);
+  else if (uploadUseSseS3 && env.SSE_MASTER_KEY) uploadData = await encryptS3(bodyBuf, env.SSE_MASTER_KEY);
+
   let result;
   try {
     result = await uploadToTelegram(
-      bodyBuf,
+      uploadData,
       bucket.tg_chat_id,
       `${upload.key}.part${partNumber.toString().padStart(4, '0')}`,
       'application/octet-stream',
@@ -177,10 +219,70 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
     partHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
     partHeaders['x-amz-server-side-encryption-customer-key-MD5'] = uploadSseMd5;
   }
+  if (uploadUseSseS3) partHeaders['x-amz-server-side-encryption'] = 'AES256';
   return new Response(null, {
     status: 200,
     headers: partHeaders,
   });
+}
+
+async function handleLargeUploadPartViaVps(input: {
+  s3: S3Request;
+  env: Env;
+  ctx: ExecutionContext;
+  store: MetadataStore;
+  uploadId: string;
+  partNumber: number;
+  bucket: { tg_chat_id: string; tg_topic_id: number | null };
+  uploadKey: string;
+  size: number;
+  sseKeyBase64?: string;
+  sseS3KeyBase64?: string;
+  sseKeyMd5: string | null;
+  useSseS3: boolean;
+}): Promise<Response> {
+  const {
+    s3, env, ctx, store, uploadId, partNumber, bucket, uploadKey, size,
+    sseKeyBase64, sseS3KeyBase64, sseKeyMd5, useSseS3,
+  } = input;
+  const response = await new VpsClient(env).proxyPutFull(
+    s3.body!, bucket.tg_chat_id,
+    `${uploadKey}.part${partNumber.toString().padStart(4, '0')}`,
+    'application/octet-stream', size,
+    {
+      messageThreadId: bucket.tg_topic_id,
+      sseKeyBase64,
+      sseS3KeyBase64,
+      contentMd5: s3.headers.get('content-md5') || undefined,
+    },
+  );
+  const result = await response.json() as {
+    etag: string;
+    tgChatId: string;
+    tgMessageId: number;
+    tgFileId: string;
+    size: number;
+  };
+  if (result.size !== size) {
+    ctx.waitUntil(new TelegramClient(env).deleteMessage(result.tgChatId, result.tgMessageId).catch(() => {}));
+    return errorResponse(400, 'IncompleteBody', `Expected ${size} bytes but received ${result.size}.`);
+  }
+
+  const oldPart = await store.getMultipartPart(uploadId, partNumber);
+  await store.putMultipartPart({
+    uploadId, partNumber, size: result.size, etag: result.etag,
+    tgChatId: result.tgChatId, tgMessageId: result.tgMessageId, tgFileId: result.tgFileId,
+  });
+  if (oldPart) ctx.waitUntil(cleanupParts([oldPart], env));
+
+  const headers: Record<string, string> = { 'ETag': result.etag };
+  if (sseKeyMd5) {
+    headers['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+    headers['x-amz-server-side-encryption-customer-key-MD5'] = sseKeyMd5;
+  } else if (useSseS3) {
+    headers['x-amz-server-side-encryption'] = 'AES256';
+  }
+  return new Response(null, { status: 200, headers });
 }
 
 export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -210,9 +312,10 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
   }
 
   // Validate and select only the parts listed in the request (S3 allows skipping parts)
+  const partsByNumber = new Map(dbParts.map(part => [part.part_number, part]));
   const selectedParts = [];
   for (const rp of requestParts) {
-    const dp = dbParts.find(p => p.part_number === rp.partNumber);
+    const dp = partsByNumber.get(rp.partNumber);
     if (!dp) return errorResponse(400, 'InvalidPart', `Part ${rp.partNumber} not found.`);
     // Normalize ETags: clients may send with or without surrounding quotes
     if (stripQuotes(dp.etag) !== stripQuotes(rp.etag)) return errorResponse(400, 'InvalidPart', `Part ${rp.partNumber} ETag mismatch.`);
@@ -230,139 +333,84 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
   }
 
   const totalSize = sortedParts.reduce((s, p) => s + p.size, 0);
-
-  // Size limit check
-  const maxSize = env.VPS_URL ? VPS_SINGLE_FILE_MAX : BOT_API_GETFILE_LIMIT;
-  if (totalSize > maxSize) {
-    const limitStr = env.VPS_URL ? '2GB' : '20MB';
-    return errorResponse(400, 'EntityTooLarge', `Combined size exceeds ${limitStr} limit.`);
+  if (!Number.isSafeInteger(totalSize) || totalSize > S3_MAX_OBJECT_SIZE) {
+    return errorResponse(400, 'EntityTooLarge', 'The completed object exceeds the S3 5TiB object limit.');
   }
 
-  let uploadResult: UploadResult;
-  let etag: string;
+  const etag = await computeMultipartEtag(sortedParts.map(p => p.etag));
 
   // Check if upload has encryption metadata (SSE-C or SSE-S3)
   let uploadSseKeyBase64: string | null = null;
   let uploadSseKeyMd5: string | null = null;
   let uploadUseSseS3 = false;
+  let uploadSystemMetadata: Record<string, string> = {};
   if (upload.system_metadata) {
-    try {
-      const sm = JSON.parse(upload.system_metadata);
-      if (sm._sse === 'AES256') {
-        uploadSseKeyMd5 = sm._sse_key_md5;
-        // SSE-C: parts are stored unencrypted, key is required to encrypt the final consolidated file.
-        const sseParams = parseSseCHeaders(s3.headers);
-        if (!sseParams) {
-          return errorResponse(400, 'InvalidRequest', 'This multipart upload was initiated with SSE-C. You must provide the encryption key to complete it.');
-        }
-        if (sseParams.keyMd5 !== uploadSseKeyMd5) {
-          return errorResponse(400, 'InvalidArgument', 'The SSE-C key does not match the key used to initiate the multipart upload.');
-        }
-        uploadSseKeyBase64 = sseParams.keyBase64;
-      }
-      if (sm._sse_s3 === 'AES256') {
-        uploadUseSseS3 = true;
-      }
-    } catch { /* ignore */ }
+    try { uploadSystemMetadata = JSON.parse(upload.system_metadata); } catch { /* ignore corrupt metadata */ }
   }
-
-  if (totalSize <= BOT_API_GETFILE_LIMIT) {
-    // <=20MB: consolidate in Worker memory
-    const combined = new Uint8Array(totalSize);
-    const downloads = await Promise.all(
-      sortedParts.map(part => downloadFromTelegram(part.tg_file_id, env).then(r => r.arrayBuffer())),
-    );
-    let pos = 0;
-    for (let i = 0; i < downloads.length; i++) {
-      const buf = downloads[i];
-      if (buf.byteLength !== sortedParts[i].size) {
-        return errorResponse(500, 'InternalError',
-          `Part ${sortedParts[i].part_number} size mismatch: expected ${sortedParts[i].size}, got ${buf.byteLength}`);
+  if (uploadSystemMetadata._sse === 'AES256') {
+    uploadSseKeyMd5 = uploadSystemMetadata._sse_key_md5;
+    try {
+      // Parts were encrypted independently during UploadPart. Require the
+      // same key on Complete to preserve S3 SSE-C request semantics.
+      const sseParams = parseSseCHeaders(s3.headers);
+      if (!sseParams) {
+        return errorResponse(400, 'InvalidRequest', 'This multipart upload was initiated with SSE-C. You must provide the encryption key to complete it.');
       }
-      combined.set(new Uint8Array(buf), pos);
-      pos += buf.byteLength;
-    }
-
-    etag = await computeMultipartEtag(sortedParts.map(p => p.etag));
-
-    // Encrypt consolidated file before uploading (SSE-C or SSE-S3)
-    let uploadData: ArrayBuffer = combined.buffer as ArrayBuffer;
-    if (uploadSseKeyBase64) {
-      uploadData = await encrypt(uploadData, uploadSseKeyBase64);
-    } else if (uploadUseSseS3 && env.SSE_MASTER_KEY) {
-      uploadData = await encryptS3(uploadData, env.SSE_MASTER_KEY);
-    }
-
-    try {
-      uploadResult = await uploadToTelegram(
-        uploadData,
-        bucket.tg_chat_id,
-        upload.key,
-        upload.content_type || 'application/octet-stream',
-        env,
-        bucket.tg_topic_id,
-      );
+      await validateKeyMd5(sseParams);
+      if (sseParams.keyMd5 !== uploadSseKeyMd5) {
+        return errorResponse(400, 'InvalidArgument', 'The SSE-C key does not match the key used to initiate the multipart upload.');
+      }
+      uploadSseKeyBase64 = sseParams.keyBase64;
     } catch (e) {
-      ctx.waitUntil(cleanupParts(sortedParts, env));
-      await store.deleteMultipartUpload(uploadId);
-      throw e;
-    }
-  } else {
-    // >20MB: delegate consolidation to VPS (with optional encryption)
-    try {
-      const sseOptions: { sseKeyBase64?: string; sseS3KeyBase64?: string } = {};
-      if (uploadSseKeyBase64) sseOptions.sseKeyBase64 = uploadSseKeyBase64;
-      else if (uploadUseSseS3 && env.SSE_MASTER_KEY) sseOptions.sseS3KeyBase64 = env.SSE_MASTER_KEY;
-
-      const result = await consolidateViaVps(sortedParts, bucket.tg_chat_id, upload.key, upload.content_type || 'application/octet-stream', env, bucket.tg_topic_id, sseOptions);
-      uploadResult = result;
-      // S3 multipart ETag: computed from part ETags, not content hash
-      etag = await computeMultipartEtag(sortedParts.map(p => p.etag));
-    } catch (e) {
-      ctx.waitUntil(cleanupParts(sortedParts, env));
-      await store.deleteMultipartUpload(uploadId);
+      if (e instanceof SseCError) return errorResponse(400, 'InvalidArgument', e.message);
       throw e;
     }
   }
+  uploadUseSseS3 = uploadSystemMetadata._sse_s3 === 'AES256';
+  if (uploadUseSseS3 && !env.SSE_MASTER_KEY) {
+    return errorResponse(500, 'InternalError', 'This multipart upload uses SSE-S3 but SSE_MASTER_KEY is not configured.');
+  }
 
-  const oldObj = await store.putObject({
+  const userMetadata = (() => { try { return upload.user_metadata ? JSON.parse(upload.user_metadata) : undefined; } catch { return undefined; } })();
+  const systemMetadata = (() => {
+    let base: Record<string, string> = {};
+    if (upload.system_metadata) { try { base = JSON.parse(upload.system_metadata); } catch { /* ignore corrupt */ } }
+    base['_mp_part_sizes'] = JSON.stringify(sortedParts.map(p => p.size));
+    base['_chunk_layout'] = 'multipart-v1';
+    return base;
+  })();
+  const existingObject = await store.getObject(upload.bucket, upload.key);
+  const replaced = await store.completeMultipartAsChunked({
+    uploadId,
     bucket: upload.bucket,
     key: upload.key,
     size: totalSize,
     etag,
     contentType: upload.content_type || 'application/octet-stream',
-    tgChatId: uploadResult.tgChatId,
-    tgMessageId: uploadResult.tgMessageId,
-    tgFileId: uploadResult.tgFileId,
-    tgFileUniqueId: uploadResult.tgFileUniqueId,
-    userMetadata: (() => { try { return upload.user_metadata ? JSON.parse(upload.user_metadata) : undefined; } catch { return undefined; } })(),
-    systemMetadata: (() => {
-      // Merge user-defined system metadata with internal part sizes for GetObject partNumber support
-      let base: Record<string, string> = {};
-      if (upload.system_metadata) { try { base = JSON.parse(upload.system_metadata); } catch { /* ignore corrupt */ } }
-      base['_mp_part_sizes'] = JSON.stringify(sortedParts.map(p => p.size));
-      return base;
-    })(),
-  });
+    tgChatId: bucket.tg_chat_id,
+    partNumbers: sortedParts.map(p => p.part_number),
+    userMetadata,
+    systemMetadata,
+  }, existingObject);
 
-  // Async cleanup: delete ALL part messages (including skipped ones)
-  ctx.waitUntil(cleanupParts(dbParts, env));
+  // Only unselected parts remain temporary. Selected Telegram messages are now
+  // the permanent object chunks and must never be deleted on Complete.
+  const selectedNumbers = new Set(sortedParts.map(p => p.part_number));
+  const skippedParts = dbParts.filter(part => !selectedNumbers.has(part.part_number));
+  if (skippedParts.length > 0) ctx.waitUntil(cleanupParts(skippedParts, env));
 
-  // Async cleanup: delete old TG message + stale derivatives if destination was overwritten
-  if (oldObj && oldObj.tg_file_id !== '__zero__' && oldObj.tg_file_id !== uploadResult.tgFileId) {
+  // Clean the storage previously referenced by an overwritten destination.
+  if (replaced.oldChunks.length > 0) ctx.waitUntil(cleanupParts(replaced.oldChunks, env));
+  if (replaced.oldObject && !isChunkedObject(replaced.oldObject)
+      && replaced.oldObject.tg_file_id !== '__zero__' && replaced.oldObject.tg_message_id !== 0) {
     const tg = new TelegramClient(env);
-    ctx.waitUntil(tg.deleteMessage(oldObj.tg_chat_id, oldObj.tg_message_id).then(() => {}).catch(() => {}));
+    ctx.waitUntil(tg.deleteMessage(replaced.oldObject.tg_chat_id, replaced.oldObject.tg_message_id).then(() => {}).catch(() => {}));
   }
-  if (oldObj) {
-    ctx.waitUntil(deleteDerivatives(upload.bucket, upload.key, env, store));
-    ctx.waitUntil(deleteChunks(upload.bucket, upload.key, env, store));
-  }
+  if (replaced.oldObject) ctx.waitUntil(deleteDerivatives(upload.bucket, upload.key, env, store));
 
   // Purge CDN + R2 cache for destination key (consistent with PutObject/CopyObject)
   ctx.waitUntil(purgeCdnCache(s3.url.origin, upload.bucket, upload.key));
   ctx.waitUntil(purgeR2Cache(env, upload.bucket, upload.key));
-
-  await store.deleteMultipartUpload(uploadId);
 
   const encodedKey = upload.key.split('/').map(encodeURIComponent).join('/');
   const location = `${s3.url.origin}/${encodeURIComponent(upload.bucket)}/${encodedKey}`;
@@ -453,22 +501,6 @@ export async function handleListMultipartUploads(s3: S3Request, env: Env): Promi
     nextKeyMarker: result.nextKeyMarker, nextUploadIdMarker: result.nextUploadIdMarker,
     encodingType,
   }));
-}
-
-async function consolidateViaVps(
-  parts: Array<{ tg_file_id: string }>,
-  chatId: string, filename: string, contentType: string,
-  env: Env, messageThreadId?: number | null,
-  sseOptions?: { sseKeyBase64?: string; sseS3KeyBase64?: string },
-): Promise<UploadResult> {
-  const vps = new VpsClient(env);
-  const res = await vps.consolidate(parts.map(p => p.tg_file_id), chatId, filename, contentType, messageThreadId, sseOptions);
-
-  const data = await res.json() as Record<string, unknown>;
-  if (!data.tgChatId || !data.tgMessageId || !data.tgFileId || !data.tgFileUniqueId) {
-    throw new Error(`VPS consolidate returned unexpected structure: ${JSON.stringify(data).slice(0, 200)}`);
-  }
-  return data as unknown as UploadResult;
 }
 
 async function cleanupParts(parts: Array<{ tg_chat_id: string; tg_message_id: number }>, env: Env): Promise<void> {
@@ -571,6 +603,33 @@ export async function handleUploadPartCopy(s3: S3Request, env: Env, ctx: Executi
 
   const needsDecrypt = srcEncrypted || (srcEncryptedS3 && !!env.SSE_MASTER_KEY);
 
+  // Destination multipart encryption is independent from source encryption.
+  let destSseKeyBase64: string | null = null;
+  let destSseKeyMd5: string | null = null;
+  let destUseSseS3 = false;
+  if (upload.system_metadata) {
+    try {
+      const sm = JSON.parse(upload.system_metadata);
+      if (sm._sse === 'AES256') destSseKeyMd5 = sm._sse_key_md5;
+      if (sm._sse_s3 === 'AES256') destUseSseS3 = true;
+    } catch { /* ignore corrupt */ }
+  }
+  if (destSseKeyMd5) {
+    try {
+      const destSse = parseSseCHeaders(s3.headers, SSE_HEADERS);
+      if (!destSse) return errorResponse(400, 'InvalidRequest', 'This multipart upload was initiated with SSE-C. You must provide the destination encryption key.');
+      await validateKeyMd5(destSse);
+      if (destSse.keyMd5 !== destSseKeyMd5) return errorResponse(400, 'InvalidArgument', 'The destination SSE-C key does not match the multipart upload.');
+      destSseKeyBase64 = destSse.keyBase64;
+    } catch (e) {
+      if (e instanceof SseCError) return errorResponse(400, 'InvalidArgument', e.message);
+      throw e;
+    }
+  }
+  if (destUseSseS3 && !env.SSE_MASTER_KEY) {
+    return errorResponse(500, 'InternalError', 'This multipart upload uses SSE-S3 but SSE_MASTER_KEY is not configured.');
+  }
+
   // Parse x-amz-copy-source-range (optional, format: bytes=start-end)
   const rangeHeader = s3.headers.get('x-amz-copy-source-range');
   let start = 0;
@@ -590,6 +649,18 @@ export async function handleUploadPartCopy(s3: S3Request, env: Env, ctx: Executi
   let data: ArrayBuffer;
   if (srcObj.size === 0) {
     data = new ArrayBuffer(0);
+  } else if (isChunkedObject(srcObj)) {
+    const chunks = await store.getChunks(srcBucket, srcKey);
+    const layoutError = validateChunkLayout(chunks, srcObj.size, srcObj.chunk_count);
+    if (layoutError) return errorResponse(500, 'InternalError', `Invalid source chunk metadata: ${layoutError}`);
+    try {
+      data = await readChunkRange(chunks, { start, end }, env, {
+        sseKeyBase64: srcEncrypted ? srcSse?.keyBase64 : undefined,
+        sseS3KeyBase64: srcEncryptedS3 ? env.SSE_MASTER_KEY : undefined,
+      }, WORKER_BODY_LIMIT);
+    } catch (e) {
+      return errorResponse(400, 'EntityTooLarge', e instanceof Error ? e.message : 'Copy range exceeds Worker memory limit.');
+    }
   } else if (needsDecrypt) {
     // Must download full file, decrypt, then apply range
     let fullData: ArrayBuffer;
@@ -632,11 +703,15 @@ export async function handleUploadPartCopy(s3: S3Request, env: Env, ctx: Executi
   const total = data.byteLength;
   const etag = await computeEtag(data);
 
+  let uploadData = data;
+  if (destSseKeyBase64) uploadData = await encrypt(data, destSseKeyBase64);
+  else if (destUseSseS3 && env.SSE_MASTER_KEY) uploadData = await encryptS3(data, env.SSE_MASTER_KEY);
+
   // Upload part data to TG
   let result;
   try {
     result = await uploadToTelegram(
-      data,
+      uploadData,
       bucket.tg_chat_id,
       `${upload.key}.part${partNumber.toString().padStart(4, '0')}`,
       'application/octet-stream',
@@ -671,5 +746,12 @@ export async function handleUploadPartCopy(s3: S3Request, env: Env, ctx: Executi
   }
 
   const now = new Date(Math.floor(Date.now() / 1000) * 1000).toISOString();
-  return xmlResponse(copyPartResultXml(etag, now));
+  const response = xmlResponse(copyPartResultXml(etag, now));
+  if (destSseKeyMd5) {
+    response.headers.set('x-amz-server-side-encryption-customer-algorithm', 'AES256');
+    response.headers.set('x-amz-server-side-encryption-customer-key-MD5', destSseKeyMd5);
+  } else if (destUseSseS3) {
+    response.headers.set('x-amz-server-side-encryption', 'AES256');
+  }
+  return response;
 }

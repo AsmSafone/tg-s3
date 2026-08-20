@@ -17,7 +17,7 @@ TG-S3 将 Telegram 变成 S3 兼容的对象存储后端。文件作为 Telegram
 - **Mini App** -- Telegram 内置的完整 Web UI，支持文件浏览、上传和分享管理
 - **文件分享** -- 支持密码保护、过期时间、下载限制和在线预览的分享链接
 - **服务端加密** -- 支持 SSE-C（客户提供密钥）和 SSE-S3（服务端托管密钥），采用 AES-256-GCM 加密
-- **大文件支持** -- 通过可选的 VPS 代理和 Local Bot API 支持最大 2GB 文件
+- **分块大对象** -- S3 Multipart 的 Telegram 分片会永久保留，支持完整下载与跨分片 Range；每个 Part 不超过 20MiB 时无需 VPS
 - **媒体处理** -- 通过 VPS 实现图片转换 (HEIC/WebP)、视频转码、Live Photo 处理
 - **多凭据认证** -- 基于 D1 的凭据管理，支持按存储桶和操作设置权限
 - **Cloudflare Tunnel** -- 安全连接 VPS，无需暴露公网端口
@@ -45,7 +45,11 @@ Mini App ───────┤         │                R2 (缓存)
 | CF D1 | 元数据存储（对象、存储桶、分享） | 免费套餐 |
 | CF R2 | 持久缓存，<=20MB 文件 | 免费套餐 (10GB) |
 | Telegram | 持久文件存储（无限容量） | 免费 |
-| VPS + Processor | 大文件 (>20MB)、媒体处理 | 约 $4/月（可选） |
+| VPS + Processor | 单次 PUT/Part 大于 20MB、媒体处理 | 约 $4/月（可选） |
+
+### 大对象限制
+
+`CompleteMultipartUpload` 不再把所有 Part 合并为单个 Telegram 文件。选中的每个 S3 Part 都会成为永久 Chunk，D1 记录其逻辑偏移。使用标准 Bot API 时，Part 应在 5MiB～20MiB 之间（开启 SSE 时建议约 19MiB）；S3 最多 10,000 个 Part，因此纯 Worker、无 VPS 时单个逻辑对象约可达 195GiB。配置 Local Bot API/VPS 后可使用更大的物理 Part；S3 协议的单对象上限仍为 5TiB。
 
 ## 快速开始
 

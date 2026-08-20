@@ -55,7 +55,7 @@ API token permissions: Workers Scripts:Edit, D1:Edit, R2:Edit, Account Settings:
 | `TELEGRAM_API_ID` | Telegram API ID for Local Bot API (see below) | -- |
 | `TELEGRAM_API_HASH` | Telegram API Hash for Local Bot API (see below) | -- |
 
-> **2GB file support** requires **both** the Local Bot API (`TELEGRAM_API_ID`/`TELEGRAM_API_HASH`) **and** `VPS_URL` (the Worker must be able to reach the processor, typically via Cloudflare Tunnel). With only `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` set, the 20MB limit still applies.
+> A **single PUT or multipart part above 20MiB** requires both the Local Bot API (`TELEGRAM_API_ID`/`TELEGRAM_API_HASH`) and `VPS_URL`. Large logical objects do not require a VPS: use S3 Multipart with every part at or below 20MiB (about 19MiB with SSE enabled).
 
 **Getting TELEGRAM_API_ID and TELEGRAM_API_HASH:**
 
@@ -150,5 +150,5 @@ The scheduled handler runs every 6 hours and performs:
 |----------|-------|
 | Messages per channel | ~20/minute |
 | Global message rate | ~30/second |
-| File download | 20 MB (Bot API) / 2 GB (Local Bot API) |
-| File upload | 20 MB (Bot API, aligned with download limit) / 2 GB (Local Bot API) |
+| Physical Telegram chunk | 20 MiB (Bot API) / 2 GiB (Local Bot API) |
+| Multipart logical object | ~195 GiB with 20MiB × 10,000 parts / 5TiB S3 maximum |

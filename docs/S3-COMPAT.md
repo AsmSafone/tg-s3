@@ -45,7 +45,7 @@ This document records the compatibility status and deliberate design decisions.
 - Encrypted objects skip CDN and R2 caching (each GET requires the customer key or server key)
 - ETag is always MD5 of plaintext (standard S3 behavior)
 - CopyObject supports re-encryption: `x-amz-copy-source-server-side-encryption-customer-*` headers for source decryption
-- Multipart: parts are stored unencrypted temporarily; the final consolidated file is encrypted on CompleteMultipartUpload (<=20MB in Worker, >20MB via VPS)
+- Multipart: every part is encrypted independently before Telegram upload; CompleteMultipartUpload atomically promotes selected parts to permanent chunks, so Range reads decrypt only the chunks they touch
 - Image processing variants (`?w=`, `?fmt=`, `?q=` query parameters) are not available for encrypted objects (encryption and public image hosting are mutually exclusive use cases)
 
 ## Authentication
@@ -95,7 +95,9 @@ Unsupported S3 sub-resource operations (`?acl`, `?policy`, `?cors`, `?encryption
 
 These are inherent to the Telegram storage backend:
 
-- **Single object size limit**: 2GB (Local Bot API) or 20MB (standard Bot API)
+- **Single PUT / physical part limit**: 2GiB with Local Bot API, or 20MiB with the standard Bot API (use about 19MiB when AES-GCM overhead applies)
+- **Multipart logical object limit**: 5TiB by S3 semantics and at most 10,000 parts; 20MiB parts provide about 195GiB without a VPS
+- **Cloudflare subrequests**: very large full-object GETs can reach plan-specific subrequest limits; Range requests fetch only intersecting chunks and are recommended for streaming/seek workloads
 - **SSE-KMS is not available** (no KMS integration). SSE-C and SSE-S3 are fully supported.
 - **No storage classes**: All objects are effectively STANDARD
 - **No object locking / retention**: Not applicable to Telegram storage

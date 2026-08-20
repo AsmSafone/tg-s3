@@ -53,11 +53,11 @@ CREATE INDEX idx_objects_derived ON objects (bucket, derived_from);
 
 > 约定: 下划线前缀 `_` 的键为内部使用，不通过 S3 API 返回给客户端。
 
-### chunks 表（分块文件） [Phase 2 - 分块上传/下载未实现]
+### chunks 表（分块文件）
 
-> 当前实现中，单文件大小上限为 2GB (VPS Local Bot API)。分块上传/下载流程用于突破此限制，
-> 留待后续版本实现。chunks 表已创建，CRUD 操作已实现（putChunk/getChunks/deleteChunks），
-> 当前用于 DeleteObject 时清理关联的 chunk 记录和 TG 消息。
+S3 Multipart 完成后，选中的 `multipart_parts` 会原子提升为永久 `chunks`。`objects.is_chunked=1`
+且 `chunk_count` 记录物理块数量；对象行使用 `__chunked__` 哨兵代替单个 `tg_file_id`。
+下载与 Range 根据 `offset/size` 映射到所需 Telegram 消息，覆盖、删除、复制和生命周期清理都会处理全部 Chunk。
 
 ```sql
 CREATE TABLE chunks (

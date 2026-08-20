@@ -113,7 +113,10 @@ export async function deleteDerivatives(bucket: string, key: string, env: Env, s
     await Promise.allSettled(derivatives.map(async (obj) => {
       const deleted = await store.deleteObject(bucket, obj.key);
       if (deleted) {
-        await tg.deleteMessage(deleted.tg_chat_id, deleted.tg_message_id).catch(e => console.error(`deleteDerivatives: deleteMessage(${deleted.tg_chat_id}, ${deleted.tg_message_id}) failed:`, e));
+        if (deleted.tg_message_id !== 0 && deleted.tg_file_id !== '__zero__' && deleted.tg_file_id !== '__chunked__') {
+          await tg.deleteMessage(deleted.tg_chat_id, deleted.tg_message_id).catch(e => console.error(`deleteDerivatives: deleteMessage(${deleted.tg_chat_id}, ${deleted.tg_message_id}) failed:`, e));
+        }
+        await deleteChunks(bucket, deleted.key, env, store);
       }
     }));
   } catch (e) { console.error(`deleteDerivatives(${bucket}, ${key}) failed:`, e); }

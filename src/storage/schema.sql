@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS objects (
     user_metadata   TEXT,
     system_metadata TEXT,
     derived_from    TEXT,
+    is_chunked      INTEGER NOT NULL DEFAULT 0,
+    chunk_count     INTEGER,
     PRIMARY KEY (bucket, key)
 );
 
@@ -35,6 +37,7 @@ CREATE TABLE IF NOT EXISTS objects (
 CREATE INDEX IF NOT EXISTS idx_objects_modified ON objects (bucket, last_modified);
 CREATE INDEX IF NOT EXISTS idx_objects_file_uid ON objects (tg_file_unique_id);
 CREATE INDEX IF NOT EXISTS idx_objects_derived ON objects (bucket, derived_from);
+CREATE INDEX IF NOT EXISTS idx_objects_chunked ON objects (is_chunked, bucket, key);
 
 CREATE TABLE IF NOT EXISTS multipart_uploads (
     upload_id       TEXT    PRIMARY KEY,
@@ -145,7 +148,3 @@ CREATE TABLE IF NOT EXISTS lifecycle_rules (
 
 CREATE INDEX IF NOT EXISTS idx_lifecycle_bucket ON lifecycle_rules (bucket);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_enabled ON lifecycle_rules (enabled, bucket);
-
--- [Phase 2 预留] 分块上传/下载实现时需要的 objects 表扩展:
--- ALTER TABLE objects ADD COLUMN is_chunked INTEGER NOT NULL DEFAULT 0;
--- ALTER TABLE objects ADD COLUMN chunk_count INTEGER;

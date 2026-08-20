@@ -1,5 +1,36 @@
 import type { Env, ObjectRow, BucketRow, MultipartUploadRow, MultipartPartRow, ShareTokenRow, ChunkRow, CredentialRow } from '../types';
 
+export const PROMOTE_MULTIPART_CHUNKS_SQL = `
+  INSERT INTO chunks (bucket, key, chunk_index, offset, size, tg_chat_id, tg_message_id, tg_file_id)
+  SELECT ?1, ?2, CAST(selected.key AS INTEGER),
+    COALESCE(
+      SUM(parts.size) OVER (
+        ORDER BY CAST(selected.key AS INTEGER)
+        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+      ),
+      0
+    ),
+    parts.size, parts.tg_chat_id, parts.tg_message_id, parts.tg_file_id
+  FROM json_each(?3) AS selected
+  JOIN multipart_parts AS parts
+    ON parts.upload_id = ?4
+   AND parts.part_number = CAST(selected.value AS INTEGER)
+  ORDER BY CAST(selected.key AS INTEGER)
+`;
+
+const VERIFY_MULTIPART_PARTS_SQL = `
+  INSERT INTO chunks (bucket, key, chunk_index, offset, size, tg_chat_id, tg_message_id, tg_file_id)
+  SELECT ?1, ?2, -1, 0,
+    CASE WHEN (
+      SELECT COUNT(*)
+      FROM json_each(?3) AS selected
+      JOIN multipart_parts AS parts
+        ON parts.upload_id = ?4
+       AND parts.part_number = CAST(selected.value AS INTEGER)
+    ) = ?5 THEN 1 ELSE NULL END,
+    '__verify__', 0, '__verify__'
+`;
+
 // S3 timestamps have second precision; truncate milliseconds to avoid
 // If-Modified-Since comparison failures (HTTP dates lack ms component)
 function isoNowSeconds(): string {
@@ -79,6 +110,8 @@ export class MetadataStore {
     userMetadata?: Record<string, string>;
     systemMetadata?: Record<string, string>;
     derivedFrom?: string;
+    isChunked?: boolean;
+    chunkCount?: number | null;
   }, existingObj?: ObjectRow | null): Promise<ObjectRow | null> {
     const now = isoNowSeconds();
     const metaJson = obj.userMetadata && Object.keys(obj.userMetadata).length > 0
@@ -90,19 +123,21 @@ export class MetadataStore {
     const existing = existingObj !== undefined ? existingObj : await this.getObject(obj.bucket, obj.key);
 
     const upsertStmt = this.db.prepare(`
-      INSERT INTO objects (bucket, key, size, etag, content_type, last_modified, tg_chat_id, tg_message_id, tg_file_id, tg_file_unique_id, user_metadata, system_metadata, derived_from)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO objects (bucket, key, size, etag, content_type, last_modified, tg_chat_id, tg_message_id, tg_file_id, tg_file_unique_id, user_metadata, system_metadata, derived_from, is_chunked, chunk_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(bucket, key) DO UPDATE SET
         size=excluded.size, etag=excluded.etag, content_type=excluded.content_type,
         last_modified=excluded.last_modified, tg_chat_id=excluded.tg_chat_id,
         tg_message_id=excluded.tg_message_id, tg_file_id=excluded.tg_file_id,
         tg_file_unique_id=excluded.tg_file_unique_id,
         user_metadata=excluded.user_metadata, system_metadata=excluded.system_metadata,
-        derived_from=excluded.derived_from
+        derived_from=excluded.derived_from, is_chunked=excluded.is_chunked,
+        chunk_count=excluded.chunk_count
     `).bind(
       obj.bucket, obj.key, obj.size, obj.etag, obj.contentType, now,
       obj.tgChatId, obj.tgMessageId, obj.tgFileId, obj.tgFileUniqueId,
       metaJson, sysMetaJson, obj.derivedFrom ?? null,
+      obj.isChunked ? 1 : 0, obj.isChunked ? (obj.chunkCount ?? null) : null,
     );
 
     // Batch upsert + stats update to keep them atomic
@@ -277,6 +312,82 @@ export class MetadataStore {
       'SELECT * FROM multipart_parts WHERE upload_id = ? ORDER BY part_number'
     ).bind(uploadId).all<MultipartPartRow>();
     return result.results;
+  }
+
+  /**
+   * Atomically promotes selected multipart parts to permanent object chunks.
+   * json_each keeps this to one SQL statement even for thousands of parts,
+   * avoiding D1's bound-parameter and batch-size limits.
+   */
+  async completeMultipartAsChunked(input: {
+    uploadId: string;
+    bucket: string;
+    key: string;
+    size: number;
+    etag: string;
+    contentType: string;
+    tgChatId: string;
+    partNumbers: number[];
+    userMetadata?: Record<string, string>;
+    systemMetadata?: Record<string, string>;
+  }, existingObj?: ObjectRow | null): Promise<{ oldObject: ObjectRow | null; oldChunks: ChunkRow[] }> {
+    const oldObject = existingObj !== undefined
+      ? existingObj
+      : await this.getObject(input.bucket, input.key);
+    const oldChunks = oldObject && (oldObject.is_chunked === 1 || oldObject.tg_file_id === '__chunked__')
+      ? await this.getChunks(input.bucket, input.key)
+      : [];
+
+    const now = isoNowSeconds();
+    const userMetaJson = input.userMetadata && Object.keys(input.userMetadata).length > 0
+      ? JSON.stringify(input.userMetadata) : null;
+    const systemMetaJson = input.systemMetadata && Object.keys(input.systemMetadata).length > 0
+      ? JSON.stringify(input.systemMetadata) : null;
+    const partNumbersJson = JSON.stringify(input.partNumbers);
+
+    const replaceChunks = this.db.prepare(PROMOTE_MULTIPART_CHUNKS_SQL)
+      .bind(input.bucket, input.key, partNumbersJson, input.uploadId);
+    // Deliberately violates chunks.size NOT NULL when an Abort/Complete race
+    // removes any selected part before this transaction begins. D1 then rolls
+    // the entire batch back instead of publishing a truncated object.
+    const verifyParts = this.db.prepare(VERIFY_MULTIPART_PARTS_SQL)
+      .bind(input.bucket, input.key, partNumbersJson, input.uploadId, input.partNumbers.length);
+
+    const upsertObject = this.db.prepare(`
+      INSERT INTO objects (
+        bucket, key, size, etag, content_type, last_modified,
+        tg_chat_id, tg_message_id, tg_file_id, tg_file_unique_id,
+        user_metadata, system_metadata, derived_from, is_chunked, chunk_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, '__chunked__', '__chunked__', ?, ?, NULL, 1, ?)
+      ON CONFLICT(bucket, key) DO UPDATE SET
+        size=excluded.size, etag=excluded.etag, content_type=excluded.content_type,
+        last_modified=excluded.last_modified, tg_chat_id=excluded.tg_chat_id,
+        tg_message_id=0, tg_file_id='__chunked__', tg_file_unique_id='__chunked__',
+        user_metadata=excluded.user_metadata, system_metadata=excluded.system_metadata,
+        derived_from=NULL, is_chunked=1, chunk_count=excluded.chunk_count
+    `).bind(
+      input.bucket, input.key, input.size, input.etag, input.contentType, now,
+      input.tgChatId, userMetaJson, systemMetaJson, input.partNumbers.length,
+    );
+
+    const statsStmt = oldObject
+      ? this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?) WHERE name = ?')
+        .bind(input.size - oldObject.size, input.bucket)
+      : this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?), object_count = object_count + 1 WHERE name = ?')
+        .bind(input.size, input.bucket);
+
+    await this.db.batch([
+      this.db.prepare('DELETE FROM chunks WHERE bucket = ? AND key = ?').bind(input.bucket, input.key),
+      verifyParts,
+      this.db.prepare('DELETE FROM chunks WHERE bucket = ? AND key = ? AND chunk_index = -1').bind(input.bucket, input.key),
+      replaceChunks,
+      upsertObject,
+      statsStmt,
+      this.db.prepare('DELETE FROM multipart_uploads WHERE upload_id = ?').bind(input.uploadId),
+      this.db.prepare('DELETE FROM multipart_parts WHERE upload_id = ?').bind(input.uploadId),
+    ]);
+
+    return { oldObject, oldChunks };
   }
 
   async listMultipartUploads(bucket: string, opts: {
@@ -503,10 +614,11 @@ export class MetadataStore {
   }
 
   async cleanOrphanedChunks(limit = 100): Promise<{ count: number; chunks: ChunkRow[] }> {
-    // Find chunks whose parent object no longer exists (or is not chunked)
+    // Find chunks whose parent object no longer exists or is no longer chunked.
     const orphans = await this.db.prepare(
       `SELECT c.* FROM chunks c WHERE NOT EXISTS (
-        SELECT 1 FROM objects o WHERE o.bucket = c.bucket AND o.key = c.key
+        SELECT 1 FROM objects o
+        WHERE o.bucket = c.bucket AND o.key = c.key AND o.is_chunked = 1
       ) LIMIT ?`
     ).bind(limit).all<ChunkRow>();
     if (orphans.results.length === 0) return { count: 0, chunks: [] };
@@ -671,7 +783,7 @@ export class MetadataStore {
 
   async sampleObjects(limit = 10): Promise<ObjectRow[]> {
     const result = await this.db.prepare(
-      'SELECT * FROM objects WHERE tg_file_id != \'__zero__\' ORDER BY RANDOM() LIMIT ?'
+      "SELECT * FROM objects WHERE tg_file_id NOT IN ('__zero__', '__chunked__') ORDER BY RANDOM() LIMIT ?"
     ).bind(limit).all<ObjectRow>();
     return result.results;
   }

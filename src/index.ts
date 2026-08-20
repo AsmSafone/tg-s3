@@ -1071,7 +1071,7 @@ function handleCors(): Response {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, PUT, POST, DELETE, PATCH, HEAD, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Amz-Date, X-Amz-Content-Sha256, X-Amz-Security-Token, X-Amz-Copy-Source, X-Amz-Copy-Source-Range, X-Amz-Metadata-Directive, X-Amz-Copy-Source-If-Match, X-Amz-Copy-Source-If-None-Match, X-Amz-Copy-Source-If-Modified-Since, X-Amz-Copy-Source-If-Unmodified-Since, X-Amz-Acl, X-Amz-Tagging, X-Amz-Server-Side-Encryption, X-Amz-Server-Side-Encryption-Customer-Algorithm, X-Amz-Server-Side-Encryption-Customer-Key, X-Amz-Server-Side-Encryption-Customer-Key-MD5, X-Amz-Copy-Source-Server-Side-Encryption-Customer-Algorithm, X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key, X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key-MD5, X-Amz-Storage-Class, Content-MD5, Content-Disposition, Content-Encoding, Content-Language, Cache-Control, Expires, Range, If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since, X-Amz-Meta-*',
-      'Access-Control-Expose-Headers': 'ETag, Content-Length, Content-Range, Last-Modified, Accept-Ranges, Content-Disposition, Content-Encoding, x-amz-request-id, x-amz-id-2, x-amz-error-code, x-amz-error-message, x-amz-mp-parts-count, x-amz-bucket-region, x-amz-server-side-encryption, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key-MD5, x-amz-meta-*, Retry-After, Location, Date',
+      'Access-Control-Expose-Headers': 'ETag, Content-Length, Content-Range, Last-Modified, Accept-Ranges, Content-Disposition, Content-Encoding, X-TG-S3-Chunk-Count, x-amz-request-id, x-amz-id-2, x-amz-error-code, x-amz-error-message, x-amz-mp-parts-count, x-amz-bucket-region, x-amz-server-side-encryption, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key-MD5, x-amz-meta-*, Retry-After, Location, Date',
       'Access-Control-Max-Age': '86400',
     },
   });
@@ -1080,7 +1080,7 @@ function handleCors(): Response {
 function addCorsHeaders(response: Response): Response {
   const newHeaders = new Headers(response.headers);
   newHeaders.set('Access-Control-Allow-Origin', '*');
-  newHeaders.set('Access-Control-Expose-Headers', 'ETag, Content-Length, Content-Range, Last-Modified, Accept-Ranges, Content-Disposition, Content-Encoding, x-amz-request-id, x-amz-id-2, x-amz-error-code, x-amz-error-message, x-amz-mp-parts-count, x-amz-bucket-region, x-amz-server-side-encryption, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key-MD5, x-amz-meta-*, Retry-After, Location, Date');
+  newHeaders.set('Access-Control-Expose-Headers', 'ETag, Content-Length, Content-Range, Last-Modified, Accept-Ranges, Content-Disposition, Content-Encoding, X-TG-S3-Chunk-Count, x-amz-request-id, x-amz-id-2, x-amz-error-code, x-amz-error-message, x-amz-mp-parts-count, x-amz-bucket-region, x-amz-server-side-encryption, x-amz-server-side-encryption-customer-algorithm, x-amz-server-side-encryption-customer-key-MD5, x-amz-meta-*, Retry-After, Location, Date');
   // S3 includes Date in all responses; AWS SDKs use it for clock skew detection
   if (!newHeaders.has('Date')) {
     newHeaders.set('Date', new Date().toUTCString());
@@ -1101,4 +1101,3 @@ function addCorsHeaders(response: Response): Response {
     headers: newHeaders,
   });
 }
-

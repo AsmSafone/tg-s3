@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "deploy": "wrangler deploy",
     "deploy:docker": "./deploy.sh",
     "deploy:vps": "./deploy.sh --vps",
@@ -11,8 +13,8 @@
     "db:init:remote": "wrangler d1 execute tg-s3-db --remote --file=src/storage/schema.sql"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260101.0",
+    "@cloudflare/workers-types": "^5.20260815.1",
     "typescript": "^5.7.0",
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.124.0"
   }
 }

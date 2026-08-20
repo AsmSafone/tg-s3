@@ -45,6 +45,9 @@ export async function handleHeadObject(s3: S3Request, env: Env): Promise<Respons
 
   // Build base headers (shared by 200, 304, and partNumber responses)
   const headers = buildResponseHeaders(obj, s3.query);
+  if (obj.is_chunked === 1 || obj.tg_file_id === '__chunked__') {
+    headers['X-TG-S3-Chunk-Count'] = String(obj.chunk_count ?? 0);
+  }
 
   // SSE response headers
   addSseResponseHeaders(headers, obj.system_metadata);
@@ -90,4 +93,3 @@ export async function handleHeadObject(s3: S3Request, env: Env): Promise<Respons
 
   return new Response(null, { status: 200, headers });
 }
-

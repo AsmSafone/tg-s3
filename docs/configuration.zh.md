@@ -55,7 +55,7 @@ API token 权限：Workers Scripts:Edit、D1:Edit、R2:Edit、Account Settings:R
 | `TELEGRAM_API_ID` | Telegram API ID，用于 Local Bot API（获取方式见下方） | -- |
 | `TELEGRAM_API_HASH` | Telegram API Hash，用于 Local Bot API（获取方式见下方） | -- |
 
-> **2GB 大文件支持**需要**同时**满足：Local Bot API（`TELEGRAM_API_ID`/`TELEGRAM_API_HASH`）**和** `VPS_URL`（Worker 必须能访问 processor，通常通过 Cloudflare Tunnel）。只设置 `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` 时，20MB 限制仍然生效。
+> **单次 PUT 或 Multipart Part 大于 20MiB**时，需要同时配置 Local Bot API（`TELEGRAM_API_ID`/`TELEGRAM_API_HASH`）和 `VPS_URL`。逻辑大对象无需 VPS：使用 S3 Multipart，并将每个 Part 控制在 20MiB 以内（开启 SSE 时约 19MiB）。
 
 **获取 TELEGRAM_API_ID 和 TELEGRAM_API_HASH：**
 
@@ -150,5 +150,5 @@ crons = ["0 */6 * * *"]  # 每 6 小时执行维护任务
 |------|------|
 | 每频道消息数 | 约 20/分钟 |
 | 全局消息速率 | 约 30/秒 |
-| 文件下载 | 20 MB（Bot API）/ 2 GB（Local Bot API） |
-| 文件上传 | 20 MB（Bot API，与下载限制对齐）/ 2 GB（Local Bot API） |
+| Telegram 物理 Chunk | 20 MiB（Bot API）/ 2 GiB（Local Bot API） |
+| Multipart 逻辑对象 | 20MiB × 10,000 Part 约 195GiB / S3 最大 5TiB |

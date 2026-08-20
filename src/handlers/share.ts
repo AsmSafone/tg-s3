@@ -8,6 +8,8 @@ import { BOT_API_GETFILE_LIMIT, CACHE_CONTROL_DEFAULT } from '../constants';
 import { parseRange } from '../utils/headers';
 import { detectLang } from '../i18n';
 import { signShareSession, timingSafeEqual } from '../utils/crypto';
+import { isEncrypted, isEncryptedS3 } from '../utils/sse';
+import { isChunkedObject, streamChunkRange, validateChunkLayout } from '../storage/chunked';
 
 // RFC 6266 Content-Disposition with non-ASCII filename support
 function contentDisposition(disposition: 'inline' | 'attachment', filename: string): string {
@@ -304,6 +306,31 @@ async function serveFile(obj: ObjectRow, env: Env, disposition: 'inline' | 'atta
       status: 416,
       headers: { ...baseHeaders, 'Content-Range': `bytes */${obj.size}` },
     });
+  }
+
+  if (isChunkedObject(obj)) {
+    // SSE-C keys are never persisted, so public share URLs cannot decrypt them.
+    if (isEncrypted(obj.system_metadata)) {
+      return new Response('SSE-C encrypted objects are not available through public shares.', { status: 403 });
+    }
+    if (isEncryptedS3(obj.system_metadata) && !env.SSE_MASTER_KEY) {
+      return new Response('Storage encryption key is not configured.', { status: 503 });
+    }
+    const store = new MetadataStore(env);
+    const chunks = await store.getChunks(obj.bucket, obj.key);
+    const layoutError = validateChunkLayout(chunks, obj.size, obj.chunk_count);
+    if (layoutError) return new Response(`Invalid chunk metadata: ${layoutError}`, { status: 502 });
+    const selected = range || { start: 0, end: obj.size - 1 };
+    const body = streamChunkRange(chunks, selected, env, {
+      sseS3KeyBase64: isEncryptedS3(obj.system_metadata) ? env.SSE_MASTER_KEY : undefined,
+    });
+    const responseHeaders: Record<string, string> = {
+      ...baseHeaders,
+      'Content-Length': (selected.end - selected.start + 1).toString(),
+      'X-TG-S3-Chunk-Count': chunks.length.toString(),
+    };
+    if (range) responseHeaders['Content-Range'] = `bytes ${selected.start}-${selected.end}/${obj.size}`;
+    return new Response(body, { status: range ? 206 : 200, headers: responseHeaders });
   }
 
   // For <=20MB files, we can support Range by slicing the buffer

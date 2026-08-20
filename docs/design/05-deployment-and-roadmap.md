@@ -47,8 +47,8 @@ VPS 上运行:
   - HTTP API (供 Worker 调用)
 
 额外能力:
-  - 文件 <=2GB
-  - 文件分块 (>2GB) [Phase 2]
+  - 单个 PUT/Part <=2GiB
+  - S3 Multipart 永久分块（标准 Bot API 下约 195GiB/对象，无需 VPS）
   - HTTP Range 请求 (大文件 seek)
   - HEIC/HEIF 转换
   - 实况照片支持

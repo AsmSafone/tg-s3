@@ -8,6 +8,7 @@ export const VPS_SINGLE_FILE_MAX = 2 * 1024 * 1024 * 1024; // 2GB: Local Bot API
 export const S3_MAX_KEYS_DEFAULT = 1000;
 export const S3_MAX_PART_NUMBER = 10000;
 export const S3_MIN_PART_SIZE = 5 * 1024 * 1024; // 5MB: minimum part size (except last)
+export const S3_MAX_OBJECT_SIZE = 5 * 1024 * 1024 * 1024 * 1024; // 5TiB: S3 object limit
 export const S3_MAX_PRESIGN_EXPIRES = 604800; // 7 days: S3 presigned URL maximum expiry
 
 // R2 Cache thresholds: balance cache value vs R2 operation/storage cost

@@ -322,10 +322,12 @@ Body:
 </CompleteMultipartUpload>
 ```
 
-处理策略（混合方案）：
-- **总大小 <=20MB**：Worker 内存中下载所有 parts，拼接，通过 Bot API 重新上传为单个文件，异步删除 part 消息
-- **总大小 >20MB 且有 VPS**：委托 VPS 通过 `POST /api/proxy/consolidate` 合并所有 parts 为单个文件
-- **总大小 >2GB (VPS) 或 >20MB (无 VPS)**：返回 `EntityTooLarge` 错误
+处理策略（永久分块）：
+- 校验 Part 顺序、ETag、非末尾 Part 的 5MiB 最小值，以及 S3 5TiB 对象上限
+- 在一个 D1 batch 中将选中的 `multipart_parts` 转为连续 `chunks`，写入 `is_chunked/chunk_count` 并删除上传会话
+- 不下载、不合并、不重新上传选中的 Part；未选 Part 和被覆盖对象的旧 TG 消息异步清理
+- `GetObject` 按 `offset/size` 顺序流式重组；Range 只下载相交 Chunk
+- SSE-C/SSE-S3 在 `UploadPart` 阶段逐 Chunk 加密，下载时逐 Chunk 解密
 
 ### ListBuckets
 

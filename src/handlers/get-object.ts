@@ -8,6 +8,7 @@ import { errorResponse } from '../xml/builder';
 import { BOT_API_GETFILE_LIMIT, R2_CACHE_MIN_SIZE, R2_CACHE_MAX_SIZE, CACHE_CONTROL_IMMUTABLE } from '../constants';
 import { VpsClient } from '../media/vps-client';
 import { parseSseCHeaders, validateKeyMd5, decrypt, isEncrypted, getStoredKeyMd5, addSseResponseHeaders, SseCError, isEncryptedS3, decryptS3, addSseS3ResponseHeaders } from '../utils/sse';
+import { isChunkedObject, streamChunkRange, validateChunkLayout } from '../storage/chunked';
 
 const MAX_DIRECT_DOWNLOAD = BOT_API_GETFILE_LIMIT;
 
@@ -138,7 +139,7 @@ export async function handleGetObject(s3: S3Request, env: Env, ctx?: ExecutionCo
   // Handle GetObject with partNumber (return a specific part of a multipart-uploaded object)
   const partNumberParam = s3.query.get('partNumber');
   if (partNumberParam) {
-    return handlePartNumberGet(s3, obj, headers, parseInt(partNumberParam, 10), env, sseParams, objEncryptedS3);
+    return handlePartNumberGet(s3, obj, headers, parseInt(partNumberParam, 10), env, store, sseParams, objEncryptedS3);
   }
 
   // Auto-convert HEIC/HEIF to web-compatible format (browsers can't display HEIC natively)
@@ -153,7 +154,7 @@ export async function handleGetObject(s3: S3Request, env: Env, ctx?: ExecutionCo
   let format = s3.query.get('fmt');
   const quality = s3.query.get('q');
   const fmtAuto = format === 'auto';
-  if ((width || format || quality) && isImageContentType(obj.content_type) && !obj.content_type.includes('svg')) {
+  if ((width || format || quality) && !isChunkedObject(obj) && isImageContentType(obj.content_type) && !obj.content_type.includes('svg')) {
     // Encrypted objects cannot be processed for variants (VPS would receive ciphertext)
     if (objEncrypted || objEncryptedS3) {
       return errorResponse(400, 'InvalidRequest', 'Image variants are not supported for encrypted objects.');
@@ -192,6 +193,35 @@ export async function handleGetObject(s3: S3Request, env: Env, ctx?: ExecutionCo
       status: 200,
       headers: { ...headers, 'Content-Length': '0' },
     });
+  }
+
+  // Multipart objects keep their Telegram parts as permanent chunks. Range
+  // requests only touch intersecting chunks; full GETs stream sequentially.
+  if (isChunkedObject(obj)) {
+    const chunks = await store.getChunks(s3.bucket, s3.key);
+    const layoutError = validateChunkLayout(chunks, obj.size, obj.chunk_count);
+    if (layoutError) return errorResponse(500, 'InternalError', `Invalid chunk metadata: ${layoutError}`);
+
+    const range = rangeHeader ? parseRange(rangeHeader, obj.size) : null;
+    if (range === 'unsatisfiable') {
+      return new Response(null, {
+        status: 416,
+        headers: { ...headers, 'Content-Range': `bytes */${obj.size}` },
+      });
+    }
+    const selected = range || { start: 0, end: obj.size - 1 };
+    const body = streamChunkRange(chunks, selected, env, {
+      sseKeyBase64: objEncrypted ? sseParams?.keyBase64 : undefined,
+      sseS3KeyBase64: objEncryptedS3 ? env.SSE_MASTER_KEY : undefined,
+    });
+    const responseHeaders: Record<string, string> = {
+      ...headers,
+      'Content-Length': (selected.end - selected.start + 1).toString(),
+      'X-TG-S3-Chunk-Count': chunks.length.toString(),
+      'X-Cache': 'CHUNKED',
+    };
+    if (range) responseHeaders['Content-Range'] = `bytes ${selected.start}-${selected.end}/${obj.size}`;
+    return new Response(body, { status: range ? 206 : 200, headers: responseHeaders });
   }
 
   // Skip CDN/R2 cache for SSE-C encrypted objects (cache doesn't know the key)
@@ -294,7 +324,7 @@ export async function handleGetObject(s3: S3Request, env: Env, ctx?: ExecutionCo
 
 async function handlePartNumberGet(
   s3: S3Request, obj: ObjectRow, headers: Record<string, string>,
-  partNumber: number, env: Env,
+  partNumber: number, env: Env, store: MetadataStore,
   sseParams: ReturnType<typeof parseSseCHeaders>,
   encryptedS3: boolean,
 ): Promise<Response> {
@@ -318,6 +348,26 @@ async function handlePartNumberGet(
   for (let i = 0; i < partNumber - 1; i++) start += partSizes[i];
   const partSize = partSizes[partNumber - 1];
   const end = start + partSize - 1;
+
+  if (isChunkedObject(obj)) {
+    const chunks = await store.getChunks(s3.bucket, s3.key);
+    const layoutError = validateChunkLayout(chunks, obj.size, obj.chunk_count);
+    if (layoutError) return errorResponse(500, 'InternalError', `Invalid chunk metadata: ${layoutError}`);
+    const body = streamChunkRange(chunks, { start, end }, env, {
+      sseKeyBase64: sseParams?.keyBase64,
+      sseS3KeyBase64: encryptedS3 ? env.SSE_MASTER_KEY : undefined,
+    });
+    return new Response(body, {
+      status: 206,
+      headers: {
+        ...headers,
+        'Content-Length': partSize.toString(),
+        'Content-Range': `bytes ${start}-${end}/${obj.size}`,
+        'x-amz-mp-parts-count': partSizes.length.toString(),
+        'X-TG-S3-Chunk-Count': chunks.length.toString(),
+      },
+    });
+  }
 
   const needsDecrypt = !!(sseParams || (encryptedS3 && env.SSE_MASTER_KEY));
 

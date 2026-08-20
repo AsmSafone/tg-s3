@@ -33,6 +33,8 @@ export interface ObjectRow {
   user_metadata: string | null;
   system_metadata: string | null;
   derived_from: string | null;
+  is_chunked: number;
+  chunk_count: number | null;
 }
 
 export interface BucketRow {

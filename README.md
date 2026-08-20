@@ -17,7 +17,7 @@ TG-S3 turns Telegram into an S3-compatible object storage backend. Files are sto
 - **Mini App** -- Full-featured web UI inside Telegram with file browser, uploads, and share management
 - **File sharing** -- Password-protected share links with expiry, download limits, and inline preview
 - **Server-side encryption** -- SSE-C (customer-provided keys) and SSE-S3 (server-managed keys) with AES-256-GCM
-- **Large file support** -- Files up to 2GB via optional VPS proxy with Local Bot API
+- **Chunked large objects** -- S3 multipart uploads remain as permanent Telegram chunks with transparent full and Range reads; no VPS is required when every part is <=20MiB
 - **Media processing** -- Image conversion (HEIC/WebP), video transcoding, Live Photo handling via VPS
 - **Multi-credential auth** -- D1-backed credential management with per-bucket and per-operation permissions
 - **Cloudflare Tunnel** -- Secure VPS connectivity without exposing public ports
@@ -45,7 +45,11 @@ Share Links ────┘         ▼
 | CF D1 | Metadata storage (objects, buckets, shares) | Free tier |
 | CF R2 | Persistent cache for files <=20MB | Free tier (10GB) |
 | Telegram | Persistent file storage (unlimited) | Free |
-| VPS + Processor | Large files (>20MB), media processing | ~$4/month (optional) |
+| VPS + Processor | Single PUT/part files >20MB, media processing | ~$4/month (optional) |
+
+### Large-object limits
+
+`CompleteMultipartUpload` no longer consolidates parts into one Telegram document. Each selected S3 part becomes a permanent chunk, and D1 stores its logical offset. With the standard Bot API, use parts between 5MiB and 20MiB (about 19MiB when SSE is enabled). The S3 limit of 10,000 parts yields roughly 195GiB per logical object without a VPS. A configured Local Bot API/VPS permits larger physical parts; the S3 protocol limit remains 5TiB per object.
 
 ## Quick Start
 
