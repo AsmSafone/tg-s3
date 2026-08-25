@@ -433,7 +433,8 @@ function showBucketSettings(name) {
     '</div>' +
 
     '<button class="btn" style="width:100%;margin-top:12px" onclick="saveBucketSettings(\\'' + escJs(name) + '\\')">' + esc(t('save')) + '</button>' +
-    '<button class="btn btn-outline" style="width:100%;margin-top:8px" onclick="closeModal();showSyncSetup(\\'' + escJs(name) + '\\')">' + esc(t('sync_setup_btn')) + '</button>'
+    '<button class="btn btn-outline" style="width:100%;margin-top:8px" onclick="closeModal();showSyncSetup(\\'' + escJs(name) + '\\')">' + esc(t('sync_setup_btn')) + '</button>' +
+    '<button class="btn btn-danger" style="width:100%;margin-top:12px" onclick="confirmDeleteBucket(\\'' + escJs(name) + '\\')">' + esc(t('delete_bucket')) + '</button>'
   );
 
   // Toggle optimize fields visibility
@@ -442,6 +443,29 @@ function showBucketSettings(name) {
     if (this.checked) { fields.style.opacity = '1'; fields.style.pointerEvents = 'auto'; }
     else { fields.style.opacity = '0.4'; fields.style.pointerEvents = 'none'; }
   };
+}
+
+function confirmDeleteBucket(name) {
+  closeModal();
+  showModal(
+    '<span class="modal-close" role="button" aria-label="Close" onclick="closeModal()">&times;</span>' +
+    '<h3>' + esc(t('delete_bucket')) + '</h3>' +
+    '<div style="font-size:13px;margin:12px 0">' + esc(t('delete_bucket_confirm', name)) + '</div>' +
+    '<div style="font-size:12px;color:var(--hint);margin-bottom:12px">' + esc(t('delete_bucket_hint')) + '</div>' +
+    '<button class="btn btn-danger" style="width:100%" onclick="doDeleteBucket(\\'' + escJs(name) + '\\')">' + esc(t('delete')) + '</button>'
+  );
+}
+
+async function doDeleteBucket(name) {
+  closeModal();
+  try {
+    var res = await apiFetch('/api/miniapp/bucket?name=' + encodeURIComponent(name), { method: 'DELETE' });
+    toast(t('bucket_deleted', name));
+    if (currentBucket === name) currentBucket = '';
+    await loadBuckets();
+  } catch (e) {
+    toast(t('delete_failed', e.message));
+  }
 }
 
 async function showSyncSetup(bucketName) {
@@ -1851,6 +1875,14 @@ function onBucketAllToggle(inputId) {
   } else {
     tags.style.opacity = '1';
     tags.style.pointerEvents = 'auto';
+    var activeSpans = tags.querySelectorAll('.badge-active');
+    if (activeSpans.length === 0) {
+      var firstTag = tags.querySelector('.badge');
+      if (firstTag && firstTag.getAttribute('data-bucket')) {
+        firstTag.classList.remove('badge-inactive');
+        firstTag.classList.add('badge-active');
+      }
+    }
     syncBucketInput(inputId);
   }
 }
@@ -1867,10 +1899,11 @@ function syncBucketInput(inputId) {
   var inp = document.getElementById(inputId);
   var selected = [];
   var spans = tags.querySelectorAll('.badge-active');
-  for (var i = 0; i < spans.length; i++) selected.push(spans[i].getAttribute('data-bucket'));
+  for (var i = 0; i < spans.length; i++) {
+    var bName = spans[i].getAttribute('data-bucket');
+    if (bName) selected.push(bName);
+  }
   inp.value = selected.length > 0 ? selected.join(',') : '*';
-  var cb = document.getElementById(inputId + 'All');
-  if (selected.length === 0 && !cb.checked) { cb.checked = true; onBucketAllToggle(inputId); }
 }
 
 function showCreateKey() {

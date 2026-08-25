@@ -836,10 +836,30 @@ export class MetadataStore {
   }
 
   async getActiveAdminCredential(): Promise<CredentialRow | null> {
-    const r = await this.db.prepare(
-      'SELECT * FROM credentials WHERE is_active = 1 AND permission = ? LIMIT 1'
+    // Presigned URL generation strictly requires an active admin credential (permission = 'admin')
+    const admin = await this.db.prepare(
+      'SELECT * FROM credentials WHERE is_active = 1 AND permission = ? ORDER BY created_at DESC LIMIT 1'
     ).bind('admin').first<CredentialRow>();
-    return r ?? null;
+    if (admin) return admin;
+
+    // Auto-generate default admin credential if no admin key exists
+    const akBuf = new Uint8Array(15);
+    const skBuf = new Uint8Array(30);
+    crypto.getRandomValues(akBuf);
+    crypto.getRandomValues(skBuf);
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const accessKeyId = 'TGS3' + Array.from(akBuf).map(b => chars[b % 62]).join('').slice(0, 16);
+    const secretAccessKey = Array.from(skBuf).map(b => chars[b % 62]).join('');
+
+    await this.createCredential({
+      accessKeyId,
+      secretAccessKey,
+      name: 'Default Admin Key',
+      buckets: '*',
+      permission: 'admin',
+    });
+
+    return await this.getCredentialByAccessKey(accessKeyId);
   }
 
   async createCredential(cred: { accessKeyId: string; secretAccessKey: string; name: string; buckets: string; permission: string }): Promise<void> {

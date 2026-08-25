@@ -1,0 +1,48 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch .env from Gist
+        env:
+          GIST_URL_SECRET: ${{ secrets.GIST_ENV_URL }}
+        run: |
+          GIST_URL="${GIST_URL_SECRET}"
+          echo "::add-mask::$GIST_URL"
+          if [ -z "$GIST_URL" ]; then
+            echo "Error: No Gist URL provided. Set GIST_ENV_URL secret." >&2
+            exit 1
+          fi
+          echo "Fetching .env from Gist..."
+          curl -sSL -f "$GIST_URL" -o .env
+          if [ ! -s .env ]; then
+            echo "Error: Downloaded .env file is empty or failed to fetch." >&2
+            exit 1
+          fi
+          # Convert Windows CRLF → Linux LF
+          sed -i 's/\r$//' .env
+
+      - name: Prepare deploy script
+        run: |
+          # Convert Windows CRLF → Linux LF
+          sed -i 's/\r$//' deploy.sh
+          chmod +x deploy.sh
+
+      - name: Run deploy.sh
+        run: |
+          ./deploy.sh

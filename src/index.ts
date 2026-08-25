@@ -913,6 +913,25 @@ async function handleMiniAppApi(request: Request, url: URL, env: Env, ctx: Execu
     return Response.json({ ok: true });
   }
 
+  // DELETE /api/miniapp/bucket?name=... - delete bucket
+  if (path === '/api/miniapp/bucket' && method === 'DELETE') {
+    const name = url.searchParams.get('name');
+    if (!name) return Response.json({ error: 'name required' }, { status: 400 });
+    const s3: S3Request = {
+      method: 'DELETE', bucket: name, key: '',
+      query: new URLSearchParams(), headers: request.headers,
+      body: null, url,
+    };
+    const res = await handleDeleteBucket(s3, env);
+    if (res.status === 204 || res.status === 200) {
+      return Response.json({ name, deleted: true });
+    }
+    const text = await res.text();
+    const codeMatch = text.match(/<Code>([^<]+)<\/Code>/);
+    const msgMatch = text.match(/<Message>([^<]+)<\/Message>/);
+    return Response.json({ error: msgMatch?.[1] || codeMatch?.[1] || 'Failed to delete bucket' }, { status: res.status });
+  }
+
   // PUT /api/miniapp/upload?bucket=...&key=... (direct upload, no presigned URL needed)
   if (path === '/api/miniapp/upload' && method === 'PUT') {
     const bucket = url.searchParams.get('bucket');
