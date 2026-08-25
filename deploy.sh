@@ -341,6 +341,11 @@ deploy_cf() {
   step "$(t "Checking Cloudflare authentication" "检查 Cloudflare 认证状态")"
   if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
     log "$(t "Authenticating with CLOUDFLARE_API_TOKEN" "使用 CLOUDFLARE_API_TOKEN 认证")"
+    if ! npx wrangler whoami &>/dev/null 2>&1; then
+      err "$(t "CLOUDFLARE_API_TOKEN is invalid or lacks required permissions (error 9109)." "CLOUDFLARE_API_TOKEN 无效或缺少必要权限 (错误 9109)。")"
+      err "$(t "Please generate a new Cloudflare API Token with Workers, D1, and R2 permissions." "请重新生成具有 Workers、D1 和 R2 权限的 Cloudflare API Token。")"
+      exit 1
+    fi
   elif ! npx wrangler whoami &>/dev/null 2>&1; then
     warn "$(t "wrangler not logged in, opening browser for authorization..." "wrangler 未登录, 正在打开浏览器授权...")"
     npx wrangler login
