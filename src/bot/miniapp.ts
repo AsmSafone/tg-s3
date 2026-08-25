@@ -1105,40 +1105,98 @@ async function uploadFiles(files) {
     }
 
     try {
-      await new Promise(function(resolve, reject) {
-        var xhr = new XMLHttpRequest();
-        xhr.open('PUT', API + '/api/miniapp/upload?bucket=' + encodeURIComponent(currentBucket) + '&key=' + encodeURIComponent(key));
-        xhr.setRequestHeader('Authorization', authHeader);
-        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-        xhr.upload.onprogress = function(ev) {
-          if (ev.lengthComputable && progress) {
-            var filePct = ev.loaded / ev.total;
-            var overallPct = totalBytes > 0
-              ? Math.round(((uploadedBytes + ev.loaded) / totalBytes) * 100)
-              : Math.round(((i + filePct) / total) * 100);
-            progress.style.width = overallPct + '%';
-            if (detail) detail.textContent = t('uploading_file', file.name, formatSize(ev.loaded) + ' / ' + formatSize(ev.total));
-          }
-        };
-        xhr.onload = function() {
-          if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
-          // Surface the underlying server/Telegram error instead of just the status code
-          var serverMsg = '';
-          try {
-            var rt = xhr.responseText || '';
-            if (rt.charAt(0) === '{') serverMsg = JSON.parse(rt).error || '';
-            else {
-              var a = rt.indexOf('<Message>'), b = rt.indexOf('</Message>');
-              if (a >= 0 && b > a) serverMsg = rt.slice(a + 9, b);
+      if (file.size <= 20 * 1024 * 1024) {
+        await new Promise(function(resolve, reject) {
+          var xhr = new XMLHttpRequest();
+          xhr.open('PUT', API + '/api/miniapp/upload?bucket=' + encodeURIComponent(currentBucket) + '&key=' + encodeURIComponent(key));
+          xhr.setRequestHeader('Authorization', authHeader);
+          xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+          xhr.upload.onprogress = function(ev) {
+            if (ev.lengthComputable && progress) {
+              var filePct = ev.loaded / ev.total;
+              var overallPct = totalBytes > 0
+                ? Math.round(((uploadedBytes + ev.loaded) / totalBytes) * 100)
+                : Math.round(((i + filePct) / total) * 100);
+              progress.style.width = overallPct + '%';
+              if (detail) detail.textContent = t('uploading_file', file.name, formatSize(ev.loaded) + ' / ' + formatSize(ev.total));
             }
-          } catch (_e) {}
-          reject(new Error(serverMsg ? t('upload_put_failed', xhr.status) + ': ' + serverMsg : t('upload_put_failed', xhr.status)));
-        };
-        xhr.onerror = function() { reject(new Error('Network error')); };
-        xhr.ontimeout = function() { reject(new Error('Timeout')); };
-        xhr.timeout = 300000; // 5 min
-        xhr.send(file);
-      });
+          };
+          xhr.onload = function() {
+            if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+            // Surface the underlying server/Telegram error instead of just the status code
+            var serverMsg = '';
+            try {
+              var rt = xhr.responseText || '';
+              if (rt.charAt(0) === '{') serverMsg = JSON.parse(rt).error || '';
+              else {
+                var a = rt.indexOf('<Message>'), b = rt.indexOf('</Message>');
+                if (a >= 0 && b > a) serverMsg = rt.slice(a + 9, b);
+              }
+            } catch (_e) {}
+            reject(new Error(serverMsg ? t('upload_put_failed', xhr.status) + ': ' + serverMsg : t('upload_put_failed', xhr.status)));
+          };
+          xhr.onerror = function() { reject(new Error('Network error')); };
+          xhr.ontimeout = function() { reject(new Error('Timeout')); };
+          xhr.timeout = 300000; // 5 min
+          xhr.send(file);
+        });
+      } else {
+        // Large file (>20MB): upload via S3 Multipart chunks (15MB each)
+        var PART_SIZE = 15 * 1024 * 1024;
+        var createRes = await apiFetch('/api/miniapp/upload/create?bucket=' + encodeURIComponent(currentBucket) + '&key=' + encodeURIComponent(key), { method: 'POST' });
+        var uploadId = createRes.uploadId;
+        var totalParts = Math.ceil(file.size / PART_SIZE);
+        var partsList = [];
+
+        for (var p = 0; p < totalParts; p++) {
+          if (uploadCancelled) throw new Error('Cancelled');
+          var start = p * PART_SIZE;
+          var end = Math.min(file.size, start + PART_SIZE);
+          var blob = file.slice(start, end);
+          var partNum = p + 1;
+
+          var partRes = await new Promise(function(pResolve, pReject) {
+            var pxhr = new XMLHttpRequest();
+            pxhr.open('PUT', API + '/api/miniapp/upload/part?bucket=' + encodeURIComponent(currentBucket) + '&key=' + encodeURIComponent(key) + '&uploadId=' + encodeURIComponent(uploadId) + '&partNumber=' + partNum);
+            pxhr.setRequestHeader('Authorization', authHeader);
+            pxhr.setRequestHeader('Content-Type', 'application/octet-stream');
+            pxhr.upload.onprogress = function(ev) {
+              if (ev.lengthComputable && progress) {
+                var partLoaded = start + ev.loaded;
+                var overallPct = totalBytes > 0
+                  ? Math.round(((uploadedBytes + partLoaded) / totalBytes) * 100)
+                  : Math.round((partLoaded / file.size) * 100);
+                progress.style.width = overallPct + '%';
+                if (detail) detail.textContent = t('uploading_file', file.name, formatSize(partLoaded) + ' / ' + formatSize(file.size));
+              }
+            };
+            pxhr.onload = function() {
+              if (pxhr.status >= 200 && pxhr.status < 300) {
+                var etag = pxhr.getResponseHeader('ETag') || '';
+                try {
+                  var rt = JSON.parse(pxhr.responseText);
+                  if (rt.etag) etag = rt.etag;
+                } catch (_e) {}
+                pResolve({ PartNumber: partNum, ETag: etag });
+              } else {
+                pReject(new Error('Part ' + partNum + ' failed: ' + pxhr.status));
+              }
+            };
+            pxhr.onerror = function() { pReject(new Error('Network error on part ' + partNum)); };
+            pxhr.ontimeout = function() { pReject(new Error('Timeout on part ' + partNum)); };
+            pxhr.timeout = 300000;
+            pxhr.send(blob);
+          });
+
+          partsList.push(partRes);
+        }
+
+        await apiFetch('/api/miniapp/upload/complete?bucket=' + encodeURIComponent(currentBucket) + '&key=' + encodeURIComponent(key) + '&uploadId=' + encodeURIComponent(uploadId), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ parts: partsList }),
+        });
+      }
       done++;
     } catch (e) {
       var reason = e && e.message ? e.message : '';

@@ -947,6 +947,83 @@ async function handleMiniAppApi(request: Request, url: URL, env: Env, ctx: Execu
     return handlePutObject(s3, env, ctx);
   }
 
+  // POST /api/miniapp/upload/create?bucket=...&key=... - initiate multipart upload for Mini App
+  if (path === '/api/miniapp/upload/create' && method === 'POST') {
+    const bucket = url.searchParams.get('bucket');
+    const key = url.searchParams.get('key');
+    if (!bucket || !key) return Response.json({ error: 'bucket and key required' }, { status: 400 });
+    const s3: S3Request = {
+      method: 'POST', bucket, key,
+      query: new URLSearchParams({ uploads: '' }),
+      headers: request.headers,
+      body: null, url,
+    };
+    const res = await handleCreateMultipartUpload(s3, env);
+    const text = await res.text();
+    const uploadIdMatch = text.match(/<UploadId>([^<]+)<\/UploadId>/);
+    if (!uploadIdMatch) {
+      const msgMatch = text.match(/<Message>([^<]+)<\/Message>/);
+      return Response.json({ error: msgMatch?.[1] || 'Failed to initiate upload' }, { status: res.status });
+    }
+    return Response.json({ uploadId: uploadIdMatch[1] });
+  }
+
+  // PUT /api/miniapp/upload/part?bucket=...&key=...&uploadId=...&partNumber=... - upload part
+  if (path === '/api/miniapp/upload/part' && method === 'PUT') {
+    const bucket = url.searchParams.get('bucket');
+    const key = url.searchParams.get('key');
+    const uploadId = url.searchParams.get('uploadId');
+    const partNumber = url.searchParams.get('partNumber');
+    if (!bucket || !key || !uploadId || !partNumber) {
+      return Response.json({ error: 'bucket, key, uploadId, and partNumber required' }, { status: 400 });
+    }
+    const s3: S3Request = {
+      method: 'PUT', bucket, key,
+      query: new URLSearchParams({ uploadId, partNumber }),
+      headers: request.headers,
+      body: request.body, url,
+    };
+    const res = await handleUploadPart(s3, env, ctx);
+    const etag = res.headers.get('ETag') || '';
+    if (res.status >= 200 && res.status < 300) {
+      return new Response(JSON.stringify({ etag }), {
+        status: res.status,
+        headers: { 'Content-Type': 'application/json', 'ETag': etag },
+      });
+    }
+    return res;
+  }
+
+  // POST /api/miniapp/upload/complete?bucket=...&key=...&uploadId=... - complete multipart upload
+  if (path === '/api/miniapp/upload/complete' && method === 'POST') {
+    const bucket = url.searchParams.get('bucket');
+    const key = url.searchParams.get('key');
+    const uploadId = url.searchParams.get('uploadId');
+    if (!bucket || !key || !uploadId) {
+      return Response.json({ error: 'bucket, key, and uploadId required' }, { status: 400 });
+    }
+    let bodyObj: { parts: Array<{ PartNumber: number; ETag: string }> };
+    try { bodyObj = await request.json(); } catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
+    if (!bodyObj.parts || !Array.isArray(bodyObj.parts)) {
+      return Response.json({ error: 'parts array is required' }, { status: 400 });
+    }
+    const xmlParts = bodyObj.parts.map(p => `<Part><PartNumber>${p.PartNumber}</PartNumber><ETag>${p.ETag.includes('"') ? p.ETag : `"${p.ETag}"`}</ETag></Part>`).join('');
+    const xmlBody = `<CompleteMultipartUpload>${xmlParts}</CompleteMultipartUpload>`;
+    const s3: S3Request = {
+      method: 'POST', bucket, key,
+      query: new URLSearchParams({ uploadId }),
+      headers: new Headers({ 'content-type': 'application/xml' }),
+      body: new TextEncoder().encode(xmlBody).buffer, url,
+    };
+    const res = await handleCompleteMultipartUpload(s3, env, ctx);
+    if (res.status >= 200 && res.status < 300) {
+      return Response.json({ ok: true, bucket, key });
+    }
+    const text = await res.text();
+    const msgMatch = text.match(/<Message>([^<]+)<\/Message>/);
+    return Response.json({ error: msgMatch?.[1] || 'Failed to complete upload' }, { status: res.status });
+  }
+
   // GET /api/miniapp/download?bucket=...&key=... (direct download, no presigned URL needed)
   if (path === '/api/miniapp/download' && method === 'GET') {
     const bucket = url.searchParams.get('bucket');
