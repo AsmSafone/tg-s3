@@ -157,7 +157,7 @@ persist_env() {
 
 # ---- 交互式配置 ----
 INTERACTIVE=0
-if [ "$IN_CONTAINER" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+if [ "$IN_CONTAINER" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ]; then
   INTERACTIVE=1
 fi
 
@@ -915,8 +915,10 @@ case "${1:-}" in
     deploy_vps
     ;;
   *)
-    # 自动检测
-    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+    # 自动检测: CI / GitHub Actions / NO_DOCKER 环境跳过 Docker 编排，直接通过 wrangler 部署 Worker
+    if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ "${NO_DOCKER:-0}" -eq 1 ]; then
+      deploy_cf
+    elif command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
       # Docker 全自动编排
       deploy_docker
     else

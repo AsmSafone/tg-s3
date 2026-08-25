@@ -10,7 +10,7 @@ S3_REGION = "us-east-1"
 [[d1_databases]]
 binding = "DB"
 database_name = "tg-s3-db"
-database_id = ""
+database_id = "381d0b38-9e3d-41b7-942a-57443e4558a0"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
