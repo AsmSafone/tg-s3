@@ -72,6 +72,13 @@ set -a
 source .env
 set +a
 
+# Strip carriage returns (\r) in case .env was saved with Windows CRLF line endings
+for var in TG_BOT_TOKEN DEFAULT_CHAT_ID CLOUDFLARE_API_TOKEN TG_ADMIN_IDS VPS_URL VPS_SECRET SSE_MASTER_KEY TELEGRAM_API_ID TELEGRAM_API_HASH WORKER_URL CF_CUSTOM_DOMAIN TGS3_LANG; do
+  if [ -n "${!var:-}" ]; then
+    eval "$var=\$(echo \"\${!var}\" | tr -d '\r')"
+  fi
+done
+
 # TGS3_LANG 可在 .env 中设置, 加载后重新检测; 导出以便传给 Docker 部署容器
 detect_ui_lang
 export TGS3_LANG="$UI_LANG"
@@ -93,7 +100,7 @@ sed_inplace() {
 }
 
 derive_webhook_secret() {
-  node -e "const c=require('crypto');console.log(c.createHmac('sha256',process.env.TG_BOT_TOKEN).update('tg-s3-webhook').digest('hex'))"
+  node -e "const c=require('crypto');const tok=(process.env.TG_BOT_TOKEN||'').trim();console.log(c.createHmac('sha256',tok).update('tg-s3-webhook').digest('hex'))"
 }
 
 # HTTP 请求 (Node.js fetch 替代 curl, Docker 容器内 curl 存在 SSL/CA 兼容性问题)

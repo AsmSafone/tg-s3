@@ -8,7 +8,7 @@ export function verifyBearer(request: Request, env: Env): boolean | Promise<bool
   if (parts.length !== 2 || parts[0] !== 'Bearer') return false;
 
   // Validate as Telegram WebApp initData (HMAC-SHA256)
-  return verifyTelegramInitData(parts[1], env.TG_BOT_TOKEN);
+  return verifyTelegramInitData(parts[1], env);
 }
 
 /**
@@ -20,8 +20,9 @@ export function verifyBearer(request: Request, env: Env): boolean | Promise<bool
  * 3. secret_key = HMAC-SHA256("WebAppData", bot_token)
  * 4. Verify HMAC-SHA256(data_check_string, secret_key) === hash
  * 5. Check auth_date freshness (allow up to 1 hour)
+ * 6. If TG_ADMIN_IDS is set, verify user ID is allowed
  */
-async function verifyTelegramInitData(initData: string, botToken: string): Promise<boolean> {
+async function verifyTelegramInitData(initData: string, env: Env): Promise<boolean> {
   try {
     const params = new URLSearchParams(initData);
     const hash = params.get('hash');
@@ -43,7 +44,7 @@ async function verifyTelegramInitData(initData: string, botToken: string): Promi
     const secretKey = await crypto.subtle.importKey(
       'raw', encoder.encode('WebAppData'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
     );
-    const secretBuf = await crypto.subtle.sign('HMAC', secretKey, encoder.encode(botToken));
+    const secretBuf = await crypto.subtle.sign('HMAC', secretKey, encoder.encode(env.TG_BOT_TOKEN));
 
     // computed_hash = HMAC-SHA256(data_check_string, secret_key)
     const signingKey = await crypto.subtle.importKey(
@@ -53,7 +54,29 @@ async function verifyTelegramInitData(initData: string, botToken: string): Promi
 
     // Compare hex (timing-safe)
     const computed = Array.from(new Uint8Array(sig), b => b.toString(16).padStart(2, '0')).join('');
-    return computed.length === hash.length && timingSafeEqual(computed, hash);
+    if (computed.length !== hash.length || !timingSafeEqual(computed, hash)) {
+      return false;
+    }
+
+    // If TG_ADMIN_IDS is configured, restrict access to allowed user IDs
+    if (env.TG_ADMIN_IDS) {
+      const userStr = params.get('user');
+      if (!userStr) return false;
+      let userId: number | undefined;
+      try {
+        const userObj = JSON.parse(userStr);
+        userId = userObj?.id;
+      } catch {
+        return false;
+      }
+      if (!userId) return false;
+      const allowed = env.TG_ADMIN_IDS.split(',').map(id => id.trim());
+      if (!allowed.includes(userId.toString())) {
+        return false;
+      }
+    }
+
+    return true;
   } catch {
     return false;
   }
