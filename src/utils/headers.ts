@@ -123,9 +123,14 @@ export function buildResponseHeaders(obj: ObjectRow, query?: URLSearchParams): R
       : CACHE_CONTROL_DEFAULT;
   }
 
-  if (!h['Content-Disposition'] && isImageContentType(obj.content_type)) {
-    h['Content-Disposition'] = 'inline';
-    h['Access-Control-Allow-Origin'] = '*';
+  if (!h['Content-Disposition']) {
+    const filename = obj.key.split('/').pop() || obj.key;
+    if (isImageContentType(obj.content_type)) {
+      h['Content-Disposition'] = 'inline';
+      h['Access-Control-Allow-Origin'] = '*';
+    } else {
+      h['Content-Disposition'] = `attachment; filename="${encodeURIComponent(filename)}"`;
+    }
   }
 
   const mpMatch = obj.etag.match(/-(\d+)"$/);

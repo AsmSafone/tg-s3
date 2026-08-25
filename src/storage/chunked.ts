@@ -83,6 +83,16 @@ export function streamChunkRange(
             activeExpected = slice.endExclusive - slice.start;
             continue;
           }
+          // Unencrypted full chunks: stream directly from Telegram without buffering the entire part in Worker memory
+          if (!decryptKey && slice.start === 0 && slice.endExclusive === slice.chunk.size) {
+            const response = await downloadFromTelegram(slice.chunk.tg_file_id, env);
+            if (!response.body) throw new Error(`Chunk ${slice.chunk.chunk_index} returned no response body.`);
+            activeReader = response.body.getReader();
+            activeReceived = 0;
+            activeExpected = slice.chunk.size;
+            continue;
+          }
+
           const data = await downloadChunkPlaintext(slice.chunk, env, decryption);
           controller.enqueue(new Uint8Array(data, slice.start, slice.endExclusive - slice.start));
           sliceIndex++;

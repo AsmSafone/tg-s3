@@ -1100,10 +1100,6 @@ async function uploadFiles(files) {
     if (detail) detail.textContent = t('uploading_file', file.name, formatSize(file.size));
     if (status) status.textContent = t('uploading_progress', i + 1, total);
 
-    if (file.size > 20 * 1024 * 1024) {
-      toast(t('large_file_warning'));
-    }
-
     try {
       if (file.size <= 20 * 1024 * 1024) {
         await new Promise(function(resolve, reject) {

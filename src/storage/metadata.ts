@@ -58,10 +58,21 @@ export class MetadataStore {
   // --- Buckets ---
 
   async getBucket(name: string): Promise<BucketRow | null> {
+    await this.db.prepare(`
+      UPDATE buckets SET
+        object_count = (SELECT COUNT(*) FROM objects WHERE bucket = ?),
+        total_size = (SELECT COALESCE(SUM(size), 0) FROM objects WHERE bucket = ?)
+      WHERE name = ?
+    `).bind(name, name, name).run();
     return this.db.prepare('SELECT * FROM buckets WHERE name = ?').bind(name).first<BucketRow>();
   }
 
   async listBuckets(): Promise<BucketRow[]> {
+    await this.db.prepare(`
+      UPDATE buckets SET
+        object_count = (SELECT COUNT(*) FROM objects WHERE objects.bucket = buckets.name),
+        total_size = (SELECT COALESCE(SUM(size), 0) FROM objects WHERE objects.bucket = buckets.name)
+    `).run();
     const result = await this.db.prepare('SELECT * FROM buckets ORDER BY name').all<BucketRow>();
     return result.results;
   }
@@ -141,9 +152,12 @@ export class MetadataStore {
     );
 
     // Batch upsert + stats update to keep them atomic
-    const statsStmt = existing
-      ? this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?), object_count = MAX(0, object_count + ?) WHERE name = ?').bind(obj.size - existing.size, 0, obj.bucket)
-      : this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?), object_count = MAX(0, object_count + ?) WHERE name = ?').bind(obj.size, 1, obj.bucket);
+    const statsStmt = this.db.prepare(`
+      UPDATE buckets SET
+        object_count = (SELECT COUNT(*) FROM objects WHERE bucket = ?),
+        total_size = (SELECT COALESCE(SUM(size), 0) FROM objects WHERE bucket = ?)
+      WHERE name = ?
+    `).bind(obj.bucket, obj.bucket, obj.bucket);
     await this.db.batch([upsertStmt, statsStmt]);
 
     return existing;
@@ -154,9 +168,15 @@ export class MetadataStore {
     if (!obj) return null;
 
     // Batch delete + stats update to keep them atomic
+    const statsStmt = this.db.prepare(`
+      UPDATE buckets SET
+        object_count = (SELECT COUNT(*) FROM objects WHERE bucket = ?),
+        total_size = (SELECT COALESCE(SUM(size), 0) FROM objects WHERE bucket = ?)
+      WHERE name = ?
+    `).bind(bucket, bucket, bucket);
     await this.db.batch([
       this.db.prepare('DELETE FROM objects WHERE bucket = ? AND key = ?').bind(bucket, key),
-      this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?), object_count = MAX(0, object_count + ?) WHERE name = ?').bind(-obj.size, -1, bucket),
+      statsStmt,
     ]);
     return obj;
   }
@@ -370,11 +390,12 @@ export class MetadataStore {
       input.tgChatId, userMetaJson, systemMetaJson, input.partNumbers.length,
     );
 
-    const statsStmt = oldObject
-      ? this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?) WHERE name = ?')
-        .bind(input.size - oldObject.size, input.bucket)
-      : this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?), object_count = object_count + 1 WHERE name = ?')
-        .bind(input.size, input.bucket);
+    const statsStmt = this.db.prepare(`
+      UPDATE buckets SET
+        object_count = (SELECT COUNT(*) FROM objects WHERE bucket = ?),
+        total_size = (SELECT COALESCE(SUM(size), 0) FROM objects WHERE bucket = ?)
+      WHERE name = ?
+    `).bind(input.bucket, input.bucket, input.bucket);
 
     await this.db.batch([
       this.db.prepare('DELETE FROM chunks WHERE bucket = ? AND key = ?').bind(input.bucket, input.key),
