@@ -102,6 +102,28 @@ export class TelegramClient {
     });
   }
 
+  async deleteMessages(chatId: string, messageIds: number[]): Promise<boolean> {
+    if (messageIds.length === 0) return true;
+    const BATCH_SIZE = 100;
+    for (let i = 0; i < messageIds.length; i += BATCH_SIZE) {
+      const batch = messageIds.slice(i, i + BATCH_SIZE);
+      const ok = await this.withRetry(async () => {
+        const res = await fetch(`${this.baseUrl}/deleteMessages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, message_ids: batch }),
+          signal: AbortSignal.timeout(TG_API_TIMEOUT),
+        });
+        await this.checkFloodWait(res);
+        if (!res.ok) return false;
+        const data = await res.json() as { ok: boolean };
+        return data.ok;
+      });
+      if (!ok) return false;
+    }
+    return true;
+  }
+
   async forwardMessage(fromChatId: string, toChatId: string, messageId: number, messageThreadId?: number | null): Promise<TgMessageResponse> {
     return this.withRetry(async () => {
       const payload: Record<string, unknown> = { chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId };

@@ -875,7 +875,7 @@ export class MetadataStore {
     await this.createCredential({
       accessKeyId,
       secretAccessKey,
-      name: 'Default Admin Key',
+      name: 'Default Key',
       buckets: '*',
       permission: 'admin',
     });

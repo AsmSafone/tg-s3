@@ -97,9 +97,17 @@ export async function deleteChunks(bucket: string, key: string, env: Env, store:
     const chunks = await store.deleteChunks(bucket, key);
     if (chunks.length > 0) {
       const tg = new TelegramClient(env);
-      await Promise.allSettled(chunks.map(chunk =>
-        tg.deleteMessage(chunk.tg_chat_id, chunk.tg_message_id).catch(e => console.error(`deleteChunks: deleteMessage(${chunk.tg_chat_id}, ${chunk.tg_message_id}) failed:`, e))
-      ));
+      const chatMap = new Map<string, number[]>();
+      for (const chunk of chunks) {
+        if (chunk.tg_message_id && chunk.tg_message_id !== 0) {
+          const ids = chatMap.get(chunk.tg_chat_id) || [];
+          ids.push(chunk.tg_message_id);
+          chatMap.set(chunk.tg_chat_id, ids);
+        }
+      }
+      for (const [chatId, messageIds] of chatMap.entries()) {
+        await tg.deleteMessages(chatId, messageIds);
+      }
     }
   } catch (e) { console.error(`deleteChunks(${bucket}, ${key}) failed:`, e); }
 }
